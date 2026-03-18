@@ -27,12 +27,12 @@ WATCHLIST: list[str] = [
     "PFC.NS",
     "RECLTD.NS",
     "ABCAPITAL.NS",
-    "PBFINTECH.NS",
+    "ANGELONE.NS",  # replaced PBFINTECH.NS
     # ── Consumer / Growth ─────────────────────────────────────────────────────
     "TRENT.NS",
     "DIXON.NS",
     "MAXHEALTH.NS",
-    "IHCL.NS",
+    "TITAN.NS",     # replaced IHCL.NS
 ]
 
 SECTOR_MAP: dict[str, str] = {
@@ -56,11 +56,11 @@ SECTOR_MAP: dict[str, str] = {
     "PFC.NS":       "Finance",
     "RECLTD.NS":    "Finance",
     "ABCAPITAL.NS": "Fintech",
-    "PBFINTECH.NS": "Fintech",
+    "ANGELONE.NS":  "Fintech",
     "TRENT.NS":     "Consumer",
     "DIXON.NS":     "Consumer",
     "MAXHEALTH.NS": "Healthcare",
-    "IHCL.NS":      "Consumer",
+    "TITAN.NS":     "Consumer",
 }
 
 # ── Model Hyperparameters ──────────────────────────────────────────────────────
