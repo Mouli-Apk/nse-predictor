@@ -84,15 +84,16 @@ BB_STD:       float = 2.0
 
 # ── XGBoost Defaults ──────────────────────────────────────────────────────────
 XGB_PARAMS: dict = {
-    "n_estimators":    400,
-    "max_depth":       6,
-    "learning_rate":   0.05,
+    "n_estimators":    100,   # reduced from 400 — fits in 512MB RAM
+    "max_depth":       4,     # reduced from 6
+    "learning_rate":   0.1,
     "subsample":       0.8,
     "colsample_bytree":0.8,
     "reg_alpha":       0.1,
     "reg_lambda":      1.0,
     "random_state":    42,
-    "n_jobs":          -1,
+    "n_jobs":          1,     # single thread — prevents OOM on free tier
+    "tree_method":     "hist",# memory-efficient histogram method
 }
 
 # ── News Sentiment ─────────────────────────────────────────────────────────────
