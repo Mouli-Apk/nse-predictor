@@ -16,6 +16,14 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+# Configure yfinance for cloud server environments
+# - enable_timezone_cache: avoids repeated timezone lookups
+# - Newer yfinance versions auto-fetch Yahoo cookies; set cache dir to /tmp
+try:
+    yf.set_tz_cache_location("/tmp/yf_tz_cache")
+except Exception:
+    pass
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 logger = logging.getLogger("ml_logic")
@@ -70,24 +78,38 @@ def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> pd.Data
     """
     tkr = yf.Ticker(ticker)
 
+    # Try intraday intervals first
     for interval, period in [("1m", "7d"), ("5m", "60d")]:
         try:
-            df = tkr.history(period=period, interval=interval, auto_adjust=True)
+            df = tkr.history(
+                period=period,
+                interval=interval,
+                auto_adjust=True,
+                raise_errors=False,
+            )
             if not df.empty and len(df) >= 50:
                 logger.info("  fetched %s  interval=%s  rows=%d", ticker, interval, len(df))
                 return _clean_df(df)
         except Exception as exc:
             logger.warning("  %s  interval=%s  error: %s", ticker, interval, exc)
-        time.sleep(1.0)
+        time.sleep(1.5)
 
-    # Daily fallback — works from any server IP worldwide
-    try:
-        df = tkr.history(period="6mo", interval="1d", auto_adjust=True)
-        if not df.empty:
-            logger.info("  fetched %s  interval=1d (fallback)  rows=%d", ticker, len(df))
-            return _clean_df(df)
-    except Exception as exc:
-        logger.warning("  %s  daily fallback error: %s", ticker, exc)
+    # Daily fallback — Yahoo never blocks daily data, even from cloud IPs
+    for period in ["6mo", "1y", "max"]:
+        try:
+            df = tkr.history(
+                period=period,
+                interval="1d",
+                auto_adjust=True,
+                raise_errors=False,
+            )
+            if not df.empty:
+                logger.info("  fetched %s  interval=1d period=%s (fallback)  rows=%d",
+                            ticker, period, len(df))
+                return _clean_df(df)
+        except Exception as exc:
+            logger.warning("  %s  daily period=%s error: %s", ticker, period, exc)
+        time.sleep(0.5)
 
     raise ValueError(f"All fetch strategies failed for {ticker}")
 
