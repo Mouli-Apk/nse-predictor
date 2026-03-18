@@ -229,60 +229,64 @@ def train_model(ticker: str) -> dict[str, Any]:
         return {"ticker": ticker, "status": "error", "message": "xgboost not installed"}
 
     logger.info("Training model for %s …", ticker)
-    df = fetch_ohlcv(ticker)
-    df = add_features(df)
+    try:
+        df = fetch_ohlcv(ticker)
+        df = add_features(df)
 
-    # Target: % return over next PREDICTION_HORIZON candles
-    horizon = config.PREDICTION_HORIZON_MINS
-    df["target"] = df["Close"].shift(-horizon) / df["Close"] - 1
+        horizon = config.PREDICTION_HORIZON_MINS
+        df["target"] = df["Close"].shift(-horizon) / df["Close"] - 1
+        df.dropna(inplace=True)
 
-    df.dropna(inplace=True)
-    if len(df) < 200:
-        return {"ticker": ticker, "status": "error", "message": "Insufficient data"}
+        if len(df) < 200:
+            logger.warning("  ✗ %s  insufficient data (%d rows)", ticker, len(df))
+            return {"ticker": ticker, "status": "error", "message": "Insufficient data"}
 
-    feature_cols = get_feature_columns(df)
-    X = df[feature_cols].values
-    y = df["target"].values
+        feature_cols = get_feature_columns(df)
+        X = df[feature_cols].values
+        y = df["target"].values
 
-    scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(X)
+        scaler = RobustScaler()
+        X_scaled = scaler.fit_transform(X)
 
-    # Time-series CV (no leakage)
-    tscv   = TimeSeriesSplit(n_splits=4)
-    mapes  = []
-    model  = None
+        tscv  = TimeSeriesSplit(n_splits=4)
+        mapes = []
+        model = None
 
-    for fold, (tr_idx, va_idx) in enumerate(tscv.split(X_scaled)):
-        m = XGBRegressor(**config.XGB_PARAMS)
-        m.fit(
-            X_scaled[tr_idx], y[tr_idx],
-            eval_set=[(X_scaled[va_idx], y[va_idx])],
-            verbose=False,
-        )
-        preds  = m.predict(X_scaled[va_idx])
-        mape   = mean_absolute_percentage_error(y[va_idx], preds) * 100
-        mapes.append(mape)
-        model = m   # keep the last fold model (trained on most data)
+        for fold, (tr_idx, va_idx) in enumerate(tscv.split(X_scaled)):
+            m = XGBRegressor(**config.XGB_PARAMS)
+            m.fit(
+                X_scaled[tr_idx], y[tr_idx],
+                eval_set=[(X_scaled[va_idx], y[va_idx])],
+                verbose=False,
+            )
+            preds = m.predict(X_scaled[va_idx])
+            mape  = mean_absolute_percentage_error(y[va_idx], preds) * 100
+            mapes.append(mape)
+            model = m
 
-    val_mape = float(np.mean(mapes))
+        val_mape = float(np.mean(mapes))
 
-    _MODEL_REGISTRY[ticker] = {
-        "model":      model,
-        "scaler":     scaler,
-        "features":   feature_cols,
-        "trained_at": datetime.utcnow(),
-        "val_mape":   val_mape,
-        "row_count":  len(df),
-    }
+        _MODEL_REGISTRY[ticker] = {
+            "model":      model,
+            "scaler":     scaler,
+            "features":   feature_cols,
+            "trained_at": datetime.utcnow(),
+            "val_mape":   val_mape,
+            "row_count":  len(df),
+        }
 
-    logger.info("  ✓ %s  val_mape=%.2f%%  rows=%d", ticker, val_mape, len(df))
-    return {
-        "ticker":     ticker,
-        "status":     "ok",
-        "val_mape":   round(val_mape, 3),
-        "row_count":  len(df),
-        "trained_at": _MODEL_REGISTRY[ticker]["trained_at"].isoformat(),
-    }
+        logger.info("  ✓ %s  val_mape=%.2f%%  rows=%d", ticker, val_mape, len(df))
+        return {
+            "ticker":     ticker,
+            "status":     "ok",
+            "val_mape":   round(val_mape, 3),
+            "row_count":  len(df),
+            "trained_at": _MODEL_REGISTRY[ticker]["trained_at"].isoformat(),
+        }
+
+    except Exception as exc:
+        logger.warning("  ✗ %s  training failed: %s", ticker, exc)
+        return {"ticker": ticker, "status": "error", "message": str(exc)}
 
 
 def train_all(tickers: list[str] | None = None) -> list[dict]:
