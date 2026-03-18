@@ -1,0 +1,23 @@
+# Cloudflare Pages build config (also read by GitHub Actions)
+# Place this file at repo root as wrangler.toml for Worker,
+# or configure via Cloudflare Dashboard for Pages.
+
+# ── Frontend (Cloudflare Pages) ────────────────────────────────────────────────
+# Build settings to paste in Cloudflare Dashboard:
+#   Framework preset:          Vite
+#   Build command:             npm run build
+#   Build output directory:    dist
+#   Root directory:            frontend
+#   Node.js version:           20
+#
+# Environment Variables (production):
+#   VITE_API_URL = https://your-backend.railway.app
+
+# ── Cloudflare Worker (optional lightweight proxy) ────────────────────────────
+name = "nse-predictor-worker"
+main = "backend/main.py"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["python_workers"]
+
+[vars]
+ENVIRONMENT = "production"
