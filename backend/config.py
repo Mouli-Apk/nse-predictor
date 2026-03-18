@@ -5,12 +5,12 @@
 
 WATCHLIST: list[str] = [
     # ── Defense / Industrial ──────────────────────────────────────────────────
-    "MAZDOCK.NS",
     "BEL.NS",
     "BHEL.NS",
     "BHARATFORG.NS",
     "SOLARINDS.NS",
-    "COCHINSHIP.NS",
+    "HAL.NS",        # replaced MAZDOCK.NS — Hindustan Aeronautics, highly liquid
+    "RELIANCE.NS",   # replaced COCHINSHIP.NS — most liquid NSE stock
     # ── Green Energy ──────────────────────────────────────────────────────────
     "WAAREEENER.NS",
     "TATAPOWER.NS",
@@ -36,12 +36,12 @@ WATCHLIST: list[str] = [
 ]
 
 SECTOR_MAP: dict[str, str] = {
-    "MAZDOCK.NS":   "Defense",
+    "HAL.NS":       "Defense",
+    "RELIANCE.NS":  "Industrial",
     "BEL.NS":       "Defense",
     "BHEL.NS":      "Industrial",
     "BHARATFORG.NS":"Industrial",
     "SOLARINDS.NS": "Defense",
-    "COCHINSHIP.NS":"Defense",
     "WAAREEENER.NS":"Green Energy",
     "TATAPOWER.NS": "Green Energy",
     "SUZLON.NS":    "Green Energy",
