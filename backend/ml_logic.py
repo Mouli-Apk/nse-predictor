@@ -249,6 +249,11 @@ def train_model(ticker: str) -> dict[str, Any]:
             logger.warning("  %s  insufficient data (%d rows)", ticker, len(df))
             return {"ticker": ticker, "status": "error", "message": "Insufficient data"}
 
+        # Cap at 2000 rows to stay within 512MB RAM on free tier
+        if len(df) > 2000:
+            df = df.tail(2000).copy()
+            logger.info("  %s  capped to 2000 rows for memory efficiency", ticker)
+
         feature_cols = get_feature_columns(df)
         X = df[feature_cols].values
         y = df["target"].values
@@ -256,7 +261,7 @@ def train_model(ticker: str) -> dict[str, Any]:
         scaler   = RobustScaler()
         X_scaled = scaler.fit_transform(X)
 
-        tscv  = TimeSeriesSplit(n_splits=4)
+        tscv  = TimeSeriesSplit(n_splits=2)  # 2 folds saves memory on free tier
         mapes = []
         model = None
 
@@ -292,7 +297,8 @@ def train_model(ticker: str) -> dict[str, Any]:
         }
 
     except Exception as exc:
-        logger.warning("  SKIP %s  error: %s", ticker, exc)
+        import traceback
+        logger.error("  FAIL %s  error: %s\n%s", ticker, exc, traceback.format_exc())
         return {"ticker": ticker, "status": "error", "message": str(exc)}
 
 
