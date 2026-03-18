@@ -295,7 +295,16 @@ def train_model(ticker: str) -> dict[str, Any]:
                 verbose=False,
             )
             preds = m.predict(X_scaled[va_idx])
-            mape  = mean_absolute_percentage_error(y[va_idx], preds) * 100
+
+            # Evaluate MAPE on PRICES not returns.
+            # MAPE on returns explodes when y_true is near zero.
+            # e.g. y_true=0.005, y_pred=0.006 → return-MAPE=20%, price-MAPE=0.1%
+            actual_prices = df["Close"].values[va_idx]
+            pred_prices   = actual_prices * (1 + preds)
+            true_prices   = actual_prices * (1 + y[va_idx])
+            # Avoid division by zero
+            safe_prices   = np.where(true_prices == 0, 1e-8, true_prices)
+            mape = float(np.mean(np.abs(pred_prices - true_prices) / safe_prices) * 100)
             mapes.append(mape)
             model = m
 
@@ -493,9 +502,13 @@ def backtest_yesterday(ticker: str) -> dict[str, Any]:
         actual_prices    = sample["Close"].values
         predicted_prices = actual_prices * (1 + y_pred)
         true_prices      = actual_prices * (1 + y_true)
-        errors           = np.abs(y_pred - y_true) / (np.abs(y_true) + 1e-8) * 100
-        mape             = float(np.mean(errors))
-        passed           = mape <= config.MAX_ERROR_THRESHOLD_PCT
+
+        # MAPE on PRICES — this is what matters for trading.
+        # Return-based MAPE explodes when returns are near zero.
+        safe_true = np.where(true_prices == 0, 1e-8, true_prices)
+        errors    = np.abs(predicted_prices - true_prices) / safe_true * 100
+        mape      = float(np.mean(errors))
+        passed    = mape <= config.MAX_ERROR_THRESHOLD_PCT
 
         steps = [
             {
@@ -503,7 +516,7 @@ def backtest_yesterday(ticker: str) -> dict[str, Any]:
                 "actual_price":    round(float(ap), 2),
                 "predicted_price": round(float(pp), 2),
                 "true_future":     round(float(tp), 2),
-                "error_pct":       round(float(err), 3),
+                "price_error_pct": round(float(err), 3),   # price-based error
             }
             for ts, ap, pp, tp, err in zip(
                 sample.index, actual_prices, predicted_prices, true_prices, errors
