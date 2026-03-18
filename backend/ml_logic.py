@@ -15,7 +15,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -101,41 +100,63 @@ def _download_with_retry(
     return pd.DataFrame()
 
 
-def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> pd.DataFrame:
-    """
-    Download the last `days` calendar days of 1-min OHLCV data from yfinance.
-    Falls back to 5-min data if 1-min is unavailable (common on cloud servers).
-    Returns a tz-naive UTC DataFrame indexed by datetime.
-    """
-    end   = datetime.now(timezone.utc)
-    start = end - timedelta(days=days + 1)   # +1 buffer for weekends
-    start_str = start.strftime("%Y-%m-%d")
-    end_str   = end.strftime("%Y-%m-%d")
-
-    # Try 1-minute first, fall back to 5-minute
-    for interval in ["1m", "5m"]:
-        df = _download_with_retry(ticker, start_str, end_str, interval)
-        if not df.empty:
-            logger.info("  fetched %s with interval=%s (%d rows)", ticker, interval, len(df))
-            break
-    else:
-        raise ValueError(f"No data returned for {ticker} after retries")
-
-    # Flatten MultiIndex columns if present
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten MultiIndex columns, keep OHLCV, strip timezone."""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
-
     df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert("UTC").tz_localize(None)
     df.dropna(inplace=True)
     return df
 
 
-def fetch_recent_prices(ticker: str, bars: int = 120) -> list[float]:
-    """Last `bars` closing prices for sparkline display (2-hour window at 1m)."""
+def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> pd.DataFrame:
+    """
+    Fetch OHLCV using Ticker.history() with period= parameter.
+    This method is more resilient to Yahoo Finance geo-blocking than yf.download()
+    with explicit date ranges.
+
+    Priority: 1m (7d) → 5m (60d) → 1d (6mo, always works from any IP)
+    """
+    tkr = yf.Ticker(ticker)
+
+    # Intraday attempts
+    for interval, period in [("1m", "7d"), ("5m", "60d")]:
+        try:
+            df = tkr.history(period=period, interval=interval, auto_adjust=True)
+            if not df.empty and len(df) >= 50:
+                logger.info("  fetched %s  interval=%s  rows=%d", ticker, interval, len(df))
+                return _clean_df(df)
+        except Exception as exc:
+            logger.warning("  %s  interval=%s  error: %s", ticker, interval, exc)
+        time.sleep(1.0)
+
+    # Daily fallback — virtually never blocked, works from any server IP
     try:
-        df = fetch_ohlcv(ticker, days=2)
-        return df["Close"].tail(bars).tolist()
+        df = tkr.history(period="6mo", interval="1d", auto_adjust=True)
+        if not df.empty:
+            logger.info("  fetched %s  interval=1d (daily fallback)  rows=%d", ticker, len(df))
+            return _clean_df(df)
+    except Exception as exc:
+        logger.warning("  %s  daily fallback error: %s", ticker, exc)
+
+    raise ValueError(f"All fetch strategies failed for {ticker}")
+
+
+def fetch_recent_prices(ticker: str, bars: int = 120) -> list[float]:
+    """Last `bars` closing prices for sparkline display."""
+    try:
+        tkr = yf.Ticker(ticker)
+        for interval, period in [("1m", "2d"), ("5m", "5d"), ("1d", "6mo")]:
+            try:
+                df = tkr.history(period=period, interval=interval, auto_adjust=True)
+                if not df.empty:
+                    return _clean_df(df)["Close"].tail(bars).tolist()
+            except Exception:
+                continue
+        return []
     except Exception:
         return []
 
