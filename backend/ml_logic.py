@@ -69,10 +69,10 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> pd.DataFrame:
+def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> tuple[pd.DataFrame, str]:
     """
     Fetch OHLCV using Ticker.history() with period= parameter.
-    More resilient to Yahoo Finance geo-blocking than yf.download().
+    Returns (dataframe, interval_string) so callers can adjust prediction horizon.
 
     Priority: 1m (7d) -> 5m (60d) -> 1d (6mo, always works from any IP)
     """
@@ -89,7 +89,7 @@ def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> pd.Data
             )
             if not df.empty and len(df) >= 50:
                 logger.info("  fetched %s  interval=%s  rows=%d", ticker, interval, len(df))
-                return _clean_df(df)
+                return _clean_df(df), interval
         except Exception as exc:
             logger.warning("  %s  interval=%s  error: %s", ticker, interval, exc)
         time.sleep(1.5)
@@ -106,12 +106,30 @@ def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> pd.Data
             if not df.empty:
                 logger.info("  fetched %s  interval=1d period=%s (fallback)  rows=%d",
                             ticker, period, len(df))
-                return _clean_df(df)
+                return _clean_df(df), "1d"
         except Exception as exc:
             logger.warning("  %s  daily period=%s error: %s", ticker, period, exc)
         time.sleep(0.5)
 
     raise ValueError(f"All fetch strategies failed for {ticker}")
+
+
+def _horizon_for_interval(interval: str) -> int:
+    """
+    Convert the target prediction horizon (15 min) into the correct number
+    of candles to shift, based on the actual data interval fetched.
+
+    1m  data → shift 15  (15 × 1min  = 15 min)
+    5m  data → shift 3   (3  × 5min  = 15 min)
+    1d  data → shift 1   (predict next trading day close — best we can do)
+    """
+    return {"1m": 15, "5m": 3, "1d": 1}.get(interval, 15)
+
+
+def _store_interval(ticker: str, interval: str) -> None:
+    """Store the fetched data interval in the model registry."""
+    if ticker in _MODEL_REGISTRY:
+        _MODEL_REGISTRY[ticker]["interval"] = interval
 
 
 def fetch_recent_prices(ticker: str, bars: int = 120) -> list[float]:
@@ -120,7 +138,8 @@ def fetch_recent_prices(ticker: str, bars: int = 120) -> list[float]:
         tkr = yf.Ticker(ticker)
         for interval, period in [("1m", "2d"), ("5m", "5d"), ("1d", "6mo")]:
             try:
-                df = tkr.history(period=period, interval=interval, auto_adjust=True)
+                df = tkr.history(period=period, interval=interval,
+                                 auto_adjust=True, raise_errors=False)
                 if not df.empty:
                     return _clean_df(df)["Close"].tail(bars).tolist()
             except Exception:
@@ -238,10 +257,13 @@ def train_model(ticker: str) -> dict[str, Any]:
 
     logger.info("Training model for %s ...", ticker)
     try:
-        df = fetch_ohlcv(ticker)
+        df, interval = fetch_ohlcv(ticker)
         df = add_features(df)
 
-        horizon = config.PREDICTION_HORIZON_MINS
+        # Use correct horizon based on actual data interval fetched
+        # 1m->15 candles=15min, 5m->3 candles=15min, 1d->1 candle=next day
+        horizon = _horizon_for_interval(interval)
+        logger.info("  %s  using horizon=%d candles for interval=%s", ticker, horizon, interval)
         df["target"] = df["Close"].shift(-horizon) / df["Close"] - 1
         df.dropna(inplace=True)
 
@@ -285,6 +307,8 @@ def train_model(ticker: str) -> dict[str, Any]:
             "trained_at": datetime.utcnow(),
             "val_mape":   val_mape,
             "row_count":  len(df),
+            "interval":   interval,
+            "horizon":    horizon,
         }
 
         logger.info("  OK %s  val_mape=%.2f%%  rows=%d", ticker, val_mape, len(df))
@@ -337,7 +361,7 @@ def predict(ticker: str) -> dict[str, Any]:
     feats  = reg["features"]
 
     try:
-        df = fetch_ohlcv(ticker, days=3)
+        df, _ = fetch_ohlcv(ticker, days=3)
         df = add_features(df)
         df.dropna(inplace=True)
 
@@ -371,9 +395,15 @@ def predict(ticker: str) -> dict[str, Any]:
 
         risk_qty = max(1, int(config.RISK_CAPITAL_INR / (current_price * config.RISK_PCT)))
 
+        interval   = reg.get("interval", "1m")
+        horizon    = reg.get("horizon", config.PREDICTION_HORIZON_MINS)
+        # Convert horizon candles back to minutes for display
+        mins_map   = {"1m": 1, "5m": 5, "1d": 1440}
+        horizon_mins = horizon * mins_map.get(interval, 1)
+
         now        = datetime.utcnow()
         entry_time = now.strftime("%H:%M")
-        exit_time  = (now + timedelta(minutes=config.PREDICTION_HORIZON_MINS)).strftime("%H:%M")
+        exit_time  = (now + timedelta(minutes=horizon_mins)).strftime("%H:%M")
         sparkline  = fetch_recent_prices(ticker)
 
         return {
@@ -392,6 +422,8 @@ def predict(ticker: str) -> dict[str, Any]:
             "exit_time":       exit_time,
             "sparkline":       sparkline,
             "trained_at":      reg["trained_at"].isoformat(),
+            "data_interval":   interval,
+            "horizon_mins":    horizon_mins,
         }
 
     except Exception as exc:
@@ -417,30 +449,43 @@ def backtest_yesterday(ticker: str) -> dict[str, Any]:
     if ticker not in _MODEL_REGISTRY:
         train_model(ticker)
 
-    reg    = _MODEL_REGISTRY[ticker]
-    model  = reg["model"]
-    scaler = reg["scaler"]
-    feats  = reg["features"]
+    reg      = _MODEL_REGISTRY[ticker]
+    model    = reg["model"]
+    scaler   = reg["scaler"]
+    feats    = reg["features"]
+    interval = reg.get("interval", "1m")
+    horizon  = reg.get("horizon", config.PREDICTION_HORIZON_MINS)
 
     try:
-        df_full = fetch_ohlcv(ticker, days=config.TRAINING_PERIOD_DAYS + 1)
-        df_full = add_features(df_full)
-        df_full["target"] = df_full["Close"].shift(-config.PREDICTION_HORIZON_MINS) / df_full["Close"] - 1
+        df_full, _ = fetch_ohlcv(ticker, days=config.TRAINING_PERIOD_DAYS + 1)
+        df_full    = add_features(df_full)
+        # Use the SAME horizon the model was trained with
+        df_full["target"] = df_full["Close"].shift(-horizon) / df_full["Close"] - 1
         df_full.dropna(inplace=True)
 
-        today     = datetime.utcnow().date()
-        yesterday = today - timedelta(days=1)
-        mask      = df_full.index.date == yesterday
-        df_yday   = df_full[mask]
+        today = datetime.utcnow().date()
 
-        if len(df_yday) < 5:
-            last_date = df_full.index.date[-1]
-            df_yday   = df_full[df_full.index.date == last_date]
+        # Walk back up to 7 days to find the last trading day
+        # (handles weekends, holidays, and timezone differences)
+        df_yday = pd.DataFrame()
+        for days_back in range(1, 8):
+            test_date = today - timedelta(days=days_back)
+            mask = df_full.index.date == test_date
+            if mask.sum() >= 2:
+                df_yday = df_full[mask]
+                backtest_date = test_date
+                break
 
         if df_yday.empty:
-            return {"ticker": ticker, "status": "error", "message": "No yesterday data"}
+            # For daily data just use the last available date
+            backtest_date = df_full.index.date[-1]
+            df_yday = df_full[df_full.index.date == backtest_date]
 
-        sample = df_yday.iloc[::max(1, config.PREDICTION_HORIZON_MINS)]
+        if df_yday.empty:
+            return {"ticker": ticker, "status": "error", "message": "No recent trading data found"}
+
+        # Sample every `horizon` rows so each sample is one full prediction window apart
+        sample = df_yday.iloc[::max(1, horizon)]
         X      = scaler.transform(sample[feats].values)
         y_true = sample["target"].values
         y_pred = model.predict(X)
@@ -465,15 +510,23 @@ def backtest_yesterday(ticker: str) -> dict[str, Any]:
             )
         ]
 
+        mins_map     = {"1m": 1, "5m": 5, "1d": 1440}
+        horizon_mins = horizon * mins_map.get(interval, 1)
+
         return {
-            "ticker":    ticker,
-            "status":    "ok",
-            "date":      str(yesterday),
-            "mape":      round(mape, 3),
-            "passed":    passed,
-            "threshold": config.MAX_ERROR_THRESHOLD_PCT,
-            "steps":     steps,
-            "summary":   f"{'PASSED' if passed else 'FAILED'} - MAPE {mape:.2f}%",
+            "ticker":        ticker,
+            "status":        "ok",
+            "date":          str(backtest_date),
+            "mape":          round(mape, 3),
+            "passed":        passed,
+            "threshold":     config.MAX_ERROR_THRESHOLD_PCT,
+            "steps":         steps,
+            "data_interval": interval,
+            "horizon_mins":  horizon_mins,
+            "summary": (
+                f"{'PASSED' if passed else 'FAILED'} — MAPE {mape:.2f}% "
+                f"(data: {interval}, horizon: {horizon_mins} min)"
+            ),
         }
 
     except Exception as exc:
