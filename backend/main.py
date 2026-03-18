@@ -46,9 +46,15 @@ _session_start: datetime = datetime.utcnow()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀  NSE Predictor starting — retraining %d models …", len(config.WATCHLIST))
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, ml_logic.train_all, config.WATCHLIST)
-    logger.info("✅  All models ready.")
+    try:
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, ml_logic.train_all, config.WATCHLIST)
+        ok  = sum(1 for r in results if r.get("status") == "ok")
+        err = len(results) - ok
+        logger.info("✅  Startup complete: %d/%d models trained. %d skipped (no data).",
+                    ok, len(config.WATCHLIST), err)
+    except Exception as exc:
+        logger.error("❌  Startup training error: %s — server will still start.", exc)
     yield
     logger.info("🛑  Shutting down.")
 
