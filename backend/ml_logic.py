@@ -8,12 +8,14 @@ and serves T+15 min price predictions with confidence scores.
 from __future__ import annotations
 
 import logging
+import time
 import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -53,24 +55,71 @@ _MODEL_REGISTRY: dict[str, dict[str, Any]] = {}
 # 1. DATA ACQUISITION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Shared requests session with browser-like headers ─────────────────────────
+#   Yahoo Finance blocks automated requests without a proper User-Agent.
+#   Using a session with headers fixes the YFTzMissingError on cloud servers.
+_YF_SESSION = requests.Session()
+_YF_SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://finance.yahoo.com/",
+})
+
+
+def _download_with_retry(
+    ticker: str,
+    start: str,
+    end: str,
+    interval: str,
+    retries: int = 3,
+    delay: float = 2.0,
+) -> pd.DataFrame:
+    """Download with retries and increasing back-off delays."""
+    for attempt in range(retries):
+        try:
+            df = yf.download(
+                ticker,
+                start=start,
+                end=end,
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+                session=_YF_SESSION,
+            )
+            if not df.empty:
+                return df
+            logger.warning("  attempt %d/%d empty for %s", attempt + 1, retries, ticker)
+        except Exception as exc:
+            logger.warning("  attempt %d/%d error for %s: %s", attempt + 1, retries, ticker, exc)
+        if attempt < retries - 1:
+            time.sleep(delay * (attempt + 1))   # 2s, 4s back-off
+    return pd.DataFrame()
+
+
 def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> pd.DataFrame:
     """
     Download the last `days` calendar days of 1-min OHLCV data from yfinance.
+    Falls back to 5-min data if 1-min is unavailable (common on cloud servers).
     Returns a tz-naive UTC DataFrame indexed by datetime.
     """
     end   = datetime.now(timezone.utc)
-    start = end - timedelta(days=days + 1)          # +1 buffer for weekends
+    start = end - timedelta(days=days + 1)   # +1 buffer for weekends
+    start_str = start.strftime("%Y-%m-%d")
+    end_str   = end.strftime("%Y-%m-%d")
 
-    df = yf.download(
-        ticker,
-        start=start.strftime("%Y-%m-%d"),
-        end=end.strftime("%Y-%m-%d"),
-        interval=config.CANDLE_INTERVAL,
-        auto_adjust=True,
-        progress=False,
-    )
-    if df.empty:
-        raise ValueError(f"No data returned for {ticker}")
+    # Try 1-minute first, fall back to 5-minute
+    for interval in ["1m", "5m"]:
+        df = _download_with_retry(ticker, start_str, end_str, interval)
+        if not df.empty:
+            logger.info("  fetched %s with interval=%s (%d rows)", ticker, interval, len(df))
+            break
+    else:
+        raise ValueError(f"No data returned for {ticker} after retries")
 
     # Flatten MultiIndex columns if present
     if isinstance(df.columns, pd.MultiIndex):
@@ -290,9 +339,19 @@ def train_model(ticker: str) -> dict[str, Any]:
 
 
 def train_all(tickers: list[str] | None = None) -> list[dict]:
-    """Retrain every ticker in the watchlist (or a subset)."""
+    """
+    Retrain every ticker in the watchlist (or a subset).
+    Adds a 1-second delay between tickers to avoid Yahoo Finance rate limiting.
+    """
     tickers = tickers or config.WATCHLIST
-    return [train_model(t) for t in tickers]
+    results = []
+    for i, ticker in enumerate(tickers):
+        result = train_model(ticker)
+        results.append(result)
+        # Polite delay between requests — avoids Yahoo rate-limit on cloud IPs
+        if i < len(tickers) - 1:
+            time.sleep(1.0)
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
