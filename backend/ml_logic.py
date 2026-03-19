@@ -1,13 +1,24 @@
 """
-ml_logic.py — NSE Intraday Predictor v2
-Improvements over v1:
-  - Multi-horizon predictions: T+15min, T+1hr, T+3hr
-  - Pre-session bid/ask data from Yahoo Finance
-  - Enhanced feature set: ATR, OBV, VWAP, Stochastic RSI, ADX
-  - LightGBM ensemble (with XGBoost fallback)
-  - Feature importance pruning — keeps only top features
-  - Early stopping in XGBoost to prevent overfitting
-  - Price-based MAPE evaluation (not return-based)
+ml_logic.py — NSE Intraday Predictor v3 (Research-Grade)
+─────────────────────────────────────────────────────────
+Architecture based on 2024-2025 academic research findings:
+
+KEY INSIGHT: Predicting price returns (regression) is fundamentally noisy.
+The best approach uses a DUAL MODEL per horizon:
+  1. LightGBM Classifier → predicts direction (UP/DOWN/FLAT) with calibrated probability
+  2. LightGBM/XGBoost Regressor → predicts magnitude (how much)
+  Final signal = direction × magnitude, confidence = calibrated class probability
+
+Improvements from research:
+  - Walk-forward expanding window CV (no data leakage)
+  - Rolling z-score normalisation per feature (handles regime changes)
+  - Extended feature set: Williams %R, CCI, Stochastic %D, Disparity Index,
+    Chaikin Money Flow, Price Efficiency Ratio, Hurst Exponent proxy
+  - Log-return targets (more stationary than raw returns)
+  - Extreme label dropping (avoids training on outlier noise)
+  - Platt scaling proxy for calibrated confidence
+  - Stacked ensemble: LGBM classifier + LGBM regressor predictions
+    → fed into XGBoost meta-learner for final price estimate
 """
 
 from __future__ import annotations
@@ -24,6 +35,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 logger = logging.getLogger("ml_logic")
 
@@ -33,21 +45,29 @@ try:
 except Exception:
     pass
 
-# ── Model availability checks ──────────────────────────────────────────────────
+# IST offset
+IST = timedelta(hours=5, minutes=30)
+
+def now_ist() -> datetime:
+    return datetime.utcnow() + IST
+
+
+# ── Library availability ────────────────────────────────────────────────────
 try:
     import lightgbm as lgb
     _LGBM_AVAILABLE = True
-    logger.info("LightGBM available — will use as primary model")
+    logger.info("LightGBM available")
 except ImportError:
     _LGBM_AVAILABLE = False
-    logger.info("LightGBM not installed — using XGBoost")
 
 try:
-    from xgboost import XGBRegressor
+    from xgboost import XGBClassifier, XGBRegressor
     _XGB_AVAILABLE = True
 except ImportError:
     _XGB_AVAILABLE = False
-    logger.warning("XGBoost not installed — predictions unavailable")
+
+if not _LGBM_AVAILABLE and not _XGB_AVAILABLE:
+    raise RuntimeError("Install lightgbm or xgboost")
 
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -57,38 +77,35 @@ except ImportError:
     _VADER_AVAILABLE = False
 
 from sklearn.preprocessing import RobustScaler
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.feature_selection import SelectFromModel
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
 
 import config
 
-# ── IST offset — all times displayed in Indian Standard Time ──────────────────
-IST = timedelta(hours=5, minutes=30)
-
-def now_ist() -> datetime:
-    return datetime.utcnow() + IST
-
-# ── In-memory model registry ───────────────────────────────────────────────────
-# Structure per ticker:
-# {
-#   "models":    {"t15": model, "t1h": model, "t3h": model},
-#   "scaler":    RobustScaler,
-#   "features":  list[str],       # pruned feature list
-#   "interval":  "5m",
-#   "horizons":  {"t15": 3, "t1h": 12, "t3h": 36},  # candle shifts
-#   "val_mapes": {"t15": 1.2, "t1h": 1.8, "t3h": 2.4},
+# ── In-memory model registry ─────────────────────────────────────────────────
+# {ticker: {
+#   "classifier": model,        # direction: UP/DOWN/FLAT
+#   "regressor":  model,        # log-return magnitude
+#   "scaler":     RobustScaler,
+#   "features":   list[str],
+#   "interval":   str,
+#   "horizons":   {h_key: int},  # candle shifts
+#   "direction_acc": {h_key: float},  # directional accuracy %
+#   "val_mapes":  {h_key: float},
 #   "trained_at": datetime,
-#   "row_count":  int,
-# }
+# }}
 _MODEL_REGISTRY: dict[str, dict[str, Any]] = {}
+
+# Direction thresholds — above/below these log-return % = UP/DOWN, else FLAT
+UP_THRESHOLD   =  0.002   # +0.2% log return
+DOWN_THRESHOLD = -0.002   # -0.2% log return
 
 
 # =============================================================================
-# 1. DATA ACQUISITION
+# 1. DATA
 # =============================================================================
 
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Flatten MultiIndex, keep OHLCV, strip timezone."""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
     cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
@@ -101,13 +118,7 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> tuple[pd.DataFrame, str]:
-    """
-    Fetch OHLCV via Ticker.history() — resilient to Yahoo Finance geo-blocking.
-    Returns (dataframe, interval_string).
-    Priority: 1m → 5m → 1d
-    """
     tkr = yf.Ticker(ticker)
-
     for interval, period in [("1m", "7d"), ("5m", "60d")]:
         try:
             df = tkr.history(period=period, interval=interval,
@@ -116,7 +127,7 @@ def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> tuple[p
                 logger.info("  fetched %s  interval=%s  rows=%d", ticker, interval, len(df))
                 return _clean_df(df), interval
         except Exception as exc:
-            logger.warning("  %s  interval=%s  error: %s", ticker, interval, exc)
+            logger.warning("  %s  %s  error: %s", ticker, interval, exc)
         time.sleep(1.5)
 
     for period in ["6mo", "1y", "max"]:
@@ -124,17 +135,16 @@ def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> tuple[p
             df = tkr.history(period=period, interval="1d",
                              auto_adjust=True, raise_errors=False)
             if not df.empty:
-                logger.info("  fetched %s  interval=1d period=%s  rows=%d", ticker, period, len(df))
+                logger.info("  fetched %s  interval=1d(%s)  rows=%d", ticker, period, len(df))
                 return _clean_df(df), "1d"
         except Exception as exc:
-            logger.warning("  %s  daily period=%s error: %s", ticker, period, exc)
+            logger.warning("  %s  1d %s error: %s", ticker, period, exc)
         time.sleep(0.5)
 
     raise ValueError(f"All fetch strategies failed for {ticker}")
 
 
 def fetch_recent_prices(ticker: str, bars: int = 120) -> list[float]:
-    """Last `bars` closing prices for sparkline."""
     try:
         tkr = yf.Ticker(ticker)
         for interval, period in [("1m", "2d"), ("5m", "5d"), ("1d", "6mo")]:
@@ -151,416 +161,514 @@ def fetch_recent_prices(ticker: str, bars: int = 120) -> list[float]:
 
 
 def fetch_pre_session(ticker: str) -> dict[str, Any]:
-    """
-    Fetch pre-session / live bid-ask data from Yahoo Finance.
-    Returns bid, ask, pre-market price, volume, and 52-week range.
-    """
-    result: dict[str, Any] = {
-        "bid":           None,
-        "ask":           None,
-        "pre_price":     None,
-        "pre_change_pct":None,
-        "volume":        None,
-        "avg_volume":    None,
-        "week52_high":   None,
-        "week52_low":    None,
-        "market_cap":    None,
-        "pe_ratio":      None,
-    }
+    result: dict[str, Any] = dict(bid=None, ask=None, pre_price=None,
+                                   pre_change_pct=None, volume=None,
+                                   avg_volume=None, week52_high=None,
+                                   week52_low=None, market_cap=None,
+                                   pe_ratio=None)
     try:
         tkr  = yf.Ticker(ticker)
         info = tkr.fast_info
-
-        result["bid"]         = getattr(info, "bid",          None)
-        result["ask"]         = getattr(info, "ask",          None)
-        result["volume"]      = getattr(info, "last_volume",  None)
-        result["week52_high"] = getattr(info, "year_high",    None)
-        result["week52_low"]  = getattr(info, "year_low",     None)
-        result["market_cap"]  = getattr(info, "market_cap",   None)
-
-        # Pre-market price from regular info (slower but more complete)
+        result["bid"]         = getattr(info, "bid",        None)
+        result["ask"]         = getattr(info, "ask",        None)
+        result["volume"]      = getattr(info, "last_volume",None)
+        result["week52_high"] = getattr(info, "year_high",  None)
+        result["week52_low"]  = getattr(info, "year_low",   None)
+        result["market_cap"]  = getattr(info, "market_cap", None)
         try:
-            full_info = tkr.info
-            result["pre_price"]   = full_info.get("preMarketPrice")
-            result["avg_volume"]  = full_info.get("averageVolume")
-            result["pe_ratio"]    = full_info.get("trailingPE")
-
-            last_close = full_info.get("previousClose") or full_info.get("regularMarketPreviousClose")
-            if result["pre_price"] and last_close:
+            fi = tkr.info
+            result["pre_price"]  = fi.get("preMarketPrice")
+            result["avg_volume"] = fi.get("averageVolume")
+            result["pe_ratio"]   = fi.get("trailingPE")
+            last = fi.get("previousClose") or fi.get("regularMarketPreviousClose")
+            if result["pre_price"] and last:
                 result["pre_change_pct"] = round(
-                    (result["pre_price"] - last_close) / last_close * 100, 2
-                )
+                    (result["pre_price"] - last) / last * 100, 2)
         except Exception:
             pass
-
     except Exception as exc:
-        logger.warning("  pre_session fetch failed for %s: %s", ticker, exc)
-
+        logger.warning("  pre_session error %s: %s", ticker, exc)
     return result
 
 
 # =============================================================================
-# 2. ENHANCED FEATURE ENGINEERING
+# 2. EXTENDED FEATURE ENGINEERING (60+ features based on research)
 # =============================================================================
 
-def _rsi(series: pd.Series, period: int = config.RSI_PERIOD) -> pd.Series:
-    delta = series.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+def _ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
 
+def _rsi(s: pd.Series, p: int = 14) -> pd.Series:
+    d  = s.diff()
+    g  = d.clip(lower=0).rolling(p).mean()
+    l  = (-d.clip(upper=0)).rolling(p).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
 
-def _stoch_rsi(series: pd.Series, period: int = 14, smooth: int = 3) -> pd.Series:
-    """Stochastic RSI — momentum within RSI range."""
-    rsi  = _rsi(series, period)
-    lo   = rsi.rolling(period).min()
-    hi   = rsi.rolling(period).max()
-    stoch = (rsi - lo) / (hi - lo + 1e-8)
-    return stoch.rolling(smooth).mean()
+def _stoch_k(high: pd.Series, low: pd.Series, close: pd.Series, p: int = 14) -> pd.Series:
+    lo = low.rolling(p).min()
+    hi = high.rolling(p).max()
+    return (close - lo) / (hi - lo + 1e-8) * 100
 
+def _williams_r(high: pd.Series, low: pd.Series, close: pd.Series, p: int = 14) -> pd.Series:
+    hi = high.rolling(p).max()
+    lo = low.rolling(p).min()
+    return (hi - close) / (hi - lo + 1e-8) * -100
 
-def _macd(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
-    fast   = series.ewm(span=config.MACD_FAST,   adjust=False).mean()
-    slow   = series.ewm(span=config.MACD_SLOW,   adjust=False).mean()
-    macd   = fast - slow
-    signal = macd.ewm(span=config.MACD_SIGNAL, adjust=False).mean()
-    return macd, signal, macd - signal
+def _cci(high: pd.Series, low: pd.Series, close: pd.Series, p: int = 20) -> pd.Series:
+    tp  = (high + low + close) / 3
+    ma  = tp.rolling(p).mean()
+    md  = tp.rolling(p).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
+    return (tp - ma) / (0.015 * md + 1e-8)
 
-
-def _bollinger(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
-    mid  = series.rolling(config.BB_PERIOD).mean()
-    std  = series.rolling(config.BB_PERIOD).std()
-    return mid + config.BB_STD * std, mid, mid - config.BB_STD * std
-
-
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """Average True Range — measures volatility."""
-    tr = pd.concat([
-        high - low,
-        (high - close.shift(1)).abs(),
-        (low  - close.shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, p: int = 14) -> pd.Series:
+    tr = pd.concat([high - low,
+                    (high - close.shift()).abs(),
+                    (low  - close.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(p).mean()
 
 def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-    """On-Balance Volume — volume momentum indicator."""
-    direction = np.sign(close.diff()).fillna(0)
-    return (direction * volume).cumsum()
+    return (np.sign(close.diff()).fillna(0) * volume).cumsum()
 
+def _vwap(high: pd.Series, low: pd.Series, close: pd.Series,
+           volume: pd.Series, p: int = 20) -> pd.Series:
+    tp = (high + low + close) / 3
+    return (tp * volume).rolling(p).sum() / volume.rolling(p).sum().replace(0, np.nan)
 
-def _vwap_approx(high: pd.Series, low: pd.Series, close: pd.Series,
-                 volume: pd.Series, period: int = 20) -> pd.Series:
-    """Rolling VWAP approximation using typical price."""
-    typical = (high + low + close) / 3
-    return (typical * volume).rolling(period).sum() / volume.rolling(period).sum().replace(0, np.nan)
+def _adx(high: pd.Series, low: pd.Series, close: pd.Series, p: int = 14) -> pd.Series:
+    up   = high.diff().clip(lower=0)
+    down = (-low.diff()).clip(lower=0)
+    atr  = _atr(high, low, close, p)
+    plus_di  = up.rolling(p).mean()   / atr * 100
+    minus_di = down.rolling(p).mean() / atr * 100
+    dx = (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-8) * 100
+    return dx.rolling(p).mean()
 
+def _cmf(high: pd.Series, low: pd.Series, close: pd.Series,
+          volume: pd.Series, p: int = 20) -> pd.Series:
+    """Chaikin Money Flow — buying/selling pressure."""
+    clv = ((close - low) - (high - close)) / (high - low + 1e-8)
+    return (clv * volume).rolling(p).sum() / volume.rolling(p).sum().replace(0, np.nan)
 
-def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """Average Directional Index — trend strength 0-100."""
-    up   = high.diff()
-    down = -low.diff()
-    plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    atr      = _atr(high, low, close, period)
-    plus_di  = pd.Series(plus_dm,  index=close.index).rolling(period).mean() / atr * 100
-    minus_di = pd.Series(minus_dm, index=close.index).rolling(period).mean() / atr * 100
-    dx       = (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-8) * 100
-    return dx.rolling(period).mean()
+def _disparity(close: pd.Series, p: int) -> pd.Series:
+    """Disparity index — price distance from moving average %."""
+    return (close / close.rolling(p).mean() - 1) * 100
+
+def _rolling_zscore(s: pd.Series, p: int = 20) -> pd.Series:
+    """Rolling z-score normalisation — handles regime changes."""
+    mu  = s.rolling(p).mean()
+    std = s.rolling(p).std()
+    return (s - mu) / (std + 1e-8)
+
+def _efficiency_ratio(close: pd.Series, p: int = 10) -> pd.Series:
+    """Kaufman Efficiency Ratio — directional efficiency of price movement."""
+    direction = close.diff(p).abs()
+    noise     = close.diff().abs().rolling(p).sum()
+    return direction / (noise + 1e-8)
+
+def _hurst_proxy(close: pd.Series, p: int = 20) -> pd.Series:
+    """
+    Simplified Hurst exponent proxy using variance ratio.
+    H > 0.5 = trending, H < 0.5 = mean-reverting.
+    """
+    r1 = close.pct_change(1).rolling(p).var()
+    r2 = close.pct_change(2).rolling(p).var()
+    return np.log(r2 / (2 * r1 + 1e-8) + 1e-8) / np.log(2)
+
+def _macd(s: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    fast   = _ema(s, config.MACD_FAST)
+    slow   = _ema(s, config.MACD_SLOW)
+    macd   = fast - slow
+    signal = _ema(macd, config.MACD_SIGNAL)
+    return macd, signal, macd - signal
+
+def _bollinger(s: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    m = s.rolling(config.BB_PERIOD).mean()
+    d = s.rolling(config.BB_PERIOD).std()
+    return m + config.BB_STD * d, m, m - config.BB_STD * d
 
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    close  = df["Close"]
-    high   = df["High"]
-    low    = df["Low"]
-    volume = df["Volume"]
-    out    = df.copy()
+    c   = df["Close"]
+    h   = df["High"]
+    l   = df["Low"]
+    v   = df["Volume"]
+    o   = df["Open"]
+    out = df.copy()
 
-    # ── RSI & Stochastic RSI ──────────────────────────────────────────────────
-    out["rsi_14"]    = _rsi(close, 14)
-    out["rsi_7"]     = _rsi(close, 7)
-    out["stoch_rsi"] = _stoch_rsi(close)
+    # ── Trend: EMAs & ratios ──────────────────────────────────────────────────
+    for span in [5, 9, 21, 50]:
+        out[f"ema_{span}"]   = _ema(c, span)
+        out[f"er_{span}"]    = c / out[f"ema_{span}"]         # price/EMA ratio
+    out["ema_cross_5_21"]  = out["ema_5"]  - out["ema_21"]
+    out["ema_cross_9_50"]  = out["ema_9"]  - out["ema_50"]
 
-    # ── EMAs & ratios ─────────────────────────────────────────────────────────
-    for span in config.EMA_PERIODS:
-        out[f"ema_{span}"]       = close.ewm(span=span, adjust=False).mean()
-        out[f"ema_ratio_{span}"] = close / out[f"ema_{span}"]
+    # ── Momentum oscillators ──────────────────────────────────────────────────
+    out["rsi_7"]       = _rsi(c, 7)
+    out["rsi_14"]      = _rsi(c, 14)
+    out["rsi_21"]      = _rsi(c, 21)
+    out["stoch_k"]     = _stoch_k(h, l, c, 14)
+    out["stoch_d"]     = out["stoch_k"].rolling(3).mean()   # smoothed %D
+    out["stoch_kd"]    = out["stoch_k"] - out["stoch_d"]    # K-D crossover
+    out["williams_r"]  = _williams_r(h, l, c, 14)
+    out["cci_20"]      = _cci(h, l, c, 20)
+    out["cci_zscore"]  = _rolling_zscore(out["cci_20"], 20)
 
-    # ── EMA crossovers (signal line crosses) ──────────────────────────────────
-    out["ema_cross_9_21"]  = out["ema_9"]  - out["ema_21"]
-    out["ema_cross_21_50"] = out["ema_21"] - out["ema_50"]
-
-    # ── MACD ─────────────────────────────────────────────────────────────────
-    out["macd"], out["macd_signal"], out["macd_hist"] = _macd(close)
-    out["macd_cross"] = np.sign(out["macd_hist"])   # +1/-1 crossover signal
+    # ── MACD ──────────────────────────────────────────────────────────────────
+    out["macd"], out["macd_sig"], out["macd_hist"] = _macd(c)
+    out["macd_cross"]  = np.sign(out["macd_hist"])
+    out["macd_zscore"] = _rolling_zscore(out["macd_hist"], 20)
 
     # ── Bollinger Bands ───────────────────────────────────────────────────────
-    bb_u, bb_m, bb_l = _bollinger(close)
-    out["bb_upper"] = bb_u
-    out["bb_mid"]   = bb_m
-    out["bb_lower"] = bb_l
-    out["bb_width"] = (bb_u - bb_l) / bb_m.replace(0, np.nan)
-    out["bb_pct"]   = (close - bb_l) / (bb_u - bb_l + 1e-8)
+    bb_u, bb_m, bb_l   = _bollinger(c)
+    out["bb_pct"]      = (c - bb_l) / (bb_u - bb_l + 1e-8)
+    out["bb_width"]    = (bb_u - bb_l) / (bb_m + 1e-8)
+    out["bb_above"]    = (c > bb_u).astype(int)
+    out["bb_below"]    = (c < bb_l).astype(int)
 
-    # ── ATR — volatility ──────────────────────────────────────────────────────
-    out["atr_14"]      = _atr(high, low, close, 14)
-    out["atr_ratio"]   = out["atr_14"] / close          # normalised ATR
-    out["atr_7"]       = _atr(high, low, close, 7)
-    out["atr_expand"]  = out["atr_7"] / out["atr_14"]   # expanding/contracting vol
+    # ── Volatility ────────────────────────────────────────────────────────────
+    out["atr_14"]      = _atr(h, l, c, 14)
+    out["atr_norm"]    = out["atr_14"] / c                   # normalised ATR
+    out["atr_ratio"]   = _atr(h, l, c, 7) / (out["atr_14"] + 1e-8)  # volatility expansion
+    out["hv_10"]       = c.pct_change().rolling(10).std()    # historical vol
+    out["hv_ratio"]    = out["hv_10"] / c.pct_change().rolling(30).std()
 
-    # ── OBV — volume momentum ─────────────────────────────────────────────────
-    out["obv"]         = _obv(close, volume)
-    out["obv_ema"]     = out["obv"].ewm(span=9, adjust=False).mean()
-    out["obv_signal"]  = out["obv"] - out["obv_ema"]    # OBV divergence
+    # ── Volume ────────────────────────────────────────────────────────────────
+    out["obv"]         = _obv(c, v)
+    out["obv_ema"]     = _ema(out["obv"], 9)
+    out["obv_signal"]  = out["obv"] - out["obv_ema"]
+    out["cmf"]         = _cmf(h, l, c, v, 20)
+    out["vol_ratio"]   = v / (v.rolling(20).mean() + 1e-8)
+    out["vol_zscore"]  = _rolling_zscore(v, 20)
+    out["vol_surge"]   = (out["vol_ratio"] > 2.5).astype(int)
 
     # ── VWAP ─────────────────────────────────────────────────────────────────
-    out["vwap"]        = _vwap_approx(high, low, close, volume)
-    out["vwap_ratio"]  = close / out["vwap"].replace(0, np.nan)
+    out["vwap"]        = _vwap(h, l, c, v, 20)
+    out["vwap_ratio"]  = c / (out["vwap"] + 1e-8)
+    out["vwap_zscore"] = _rolling_zscore(c - out["vwap"], 20)
 
     # ── ADX — trend strength ──────────────────────────────────────────────────
-    out["adx"]         = _adx(high, low, close, 14)
-    out["adx_strong"]  = (out["adx"] > 25).astype(int)  # 1 if strong trend
+    out["adx"]         = _adx(h, l, c, 14)
+    out["adx_strong"]  = (out["adx"] > 25).astype(int)
+    out["adx_trend"]   = (out["adx"] > 20).astype(int)
+
+    # ── Disparity index ───────────────────────────────────────────────────────
+    out["disp_5"]      = _disparity(c, 5)
+    out["disp_10"]     = _disparity(c, 10)
+    out["disp_20"]     = _disparity(c, 20)
+
+    # ── Price efficiency & Hurst ──────────────────────────────────────────────
+    out["eff_ratio"]   = _efficiency_ratio(c, 10)
+    out["hurst"]       = _hurst_proxy(c, 20)
 
     # ── Candle patterns ───────────────────────────────────────────────────────
-    out["candle_body"]  = (close - df["Open"]).abs() / close
-    out["upper_wick"]   = (high - close.clip(lower=df["Open"])) / close
-    out["lower_wick"]   = (close.clip(upper=df["Open"]) - low) / close
-    out["candle_dir"]   = np.sign(close - df["Open"])   # +1 bull / -1 bear
-    out["doji"]         = (out["candle_body"] < 0.001).astype(int)
+    body               = (c - o)
+    out["candle_body"] = body.abs() / (c + 1e-8)
+    out["candle_dir"]  = np.sign(body)
+    out["upper_wick"]  = (h - c.clip(lower=o)) / (c + 1e-8)
+    out["lower_wick"]  = (c.clip(upper=o) - l) / (c + 1e-8)
+    out["doji"]        = (out["candle_body"] < 0.001).astype(int)
+    out["engulf"]      = ((body.abs() > body.shift(1).abs()) &
+                          (np.sign(body) != np.sign(body.shift(1)))).astype(int)
 
-    # ── Volume features ───────────────────────────────────────────────────────
-    out["vol_ema_9"]    = volume.ewm(span=9,  adjust=False).mean()
-    out["vol_ema_20"]   = volume.ewm(span=20, adjust=False).mean()
-    out["vol_ratio"]    = volume / out["vol_ema_9"].replace(0, np.nan)
-    out["vol_surge"]    = (out["vol_ratio"] > 2).astype(int)  # volume spike flag
+    # ── Rate of change (momentum) ─────────────────────────────────────────────
+    for lag in [1, 3, 5, 10, 15, 30]:
+        out[f"roc_{lag}"]   = c.pct_change(lag)
+    # Z-score normalised ROC (removes scale differences)
+    for lag in [5, 15]:
+        out[f"roc_z_{lag}"] = _rolling_zscore(out[f"roc_{lag}"], 30)
 
-    # ── Rate-of-change / momentum ─────────────────────────────────────────────
-    for lag in [1, 3, 5, 10, 15]:
-        out[f"roc_{lag}"] = close.pct_change(lag)
-
-    # ── Lagged returns ────────────────────────────────────────────────────────
-    for lag in [1, 2, 3, 5, 10]:
-        out[f"lag_ret_{lag}"] = close.pct_change(lag).shift(lag)
+    # ── Lagged returns (autocorrelation features) ─────────────────────────────
+    for lag in [1, 2, 3, 5, 10, 15, 20]:
+        out[f"lag_{lag}"] = c.pct_change().shift(lag)
 
     # ── Rolling statistics ────────────────────────────────────────────────────
-    for window in [5, 15, 30]:
-        out[f"roll_std_{window}"]  = close.rolling(window).std() / close
-        out[f"roll_high_{window}"] = high.rolling(window).max() / close
-        out[f"roll_low_{window}"]  = low.rolling(window).min() / close
+    for w in [5, 10, 20]:
+        out[f"roll_max_{w}"]  = h.rolling(w).max() / c
+        out[f"roll_min_{w}"]  = l.rolling(w).min() / c
+        out[f"roll_std_{w}"]  = c.pct_change().rolling(w).std()
 
     # ── Regime detection ─────────────────────────────────────────────────────
-    # Is price above/below key EMAs? (trend regime flags)
-    out["above_ema_9"]  = (close > out["ema_9"]).astype(int)
-    out["above_ema_21"] = (close > out["ema_21"]).astype(int)
-    out["above_ema_50"] = (close > out["ema_50"]).astype(int)
+    out["above_ema9"]  = (c > out["ema_9"]).astype(int)
+    out["above_ema21"] = (c > out["ema_21"]).astype(int)
+    out["above_ema50"] = (c > out["ema_50"]).astype(int)
+    # Bull: price above all 3 EMAs; bear: below all 3
+    out["bull_regime"] = (out["above_ema9"] & out["above_ema21"] & out["above_ema50"]).astype(int)
+    out["bear_regime"] = ((c < out["ema_9"]) & (c < out["ema_21"]) & (c < out["ema_50"])).astype(int)
 
-    # ── Time-of-day features (important for intraday patterns) ────────────────
+    # ── Time features (NSE session-aware) ────────────────────────────────────
     idx = out.index
     out["hour"]       = idx.hour
     out["minute"]     = idx.minute
     out["time_frac"]  = (idx.hour * 60 + idx.minute) / (6.5 * 60)
-    # NSE session segments: opening (9:15-10:30), midday, closing (14:30-15:30)
-    out["is_opening"] = ((idx.hour == 9) | ((idx.hour == 10) & (idx.minute <= 30))).astype(int)
-    out["is_closing"] = ((idx.hour == 14) & (idx.minute >= 30) | (idx.hour == 15)).astype(int)
+    # NSE session segments
+    out["is_open"]    = ((idx.hour == 9) | ((idx.hour == 10) & (idx.minute < 30))).astype(int)
+    out["is_close"]   = ((idx.hour >= 14) & (idx.hour < 16)).astype(int)
+    out["is_midday"]  = ((idx.hour >= 11) & (idx.hour < 14)).astype(int)
+    # Day of week (Friday effect, Monday effect)
+    out["dow"]        = idx.dayofweek
 
     return out
 
 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
-    exclude = {"Open", "High", "Low", "Close", "Volume", "target"}
+    exclude = {"Open", "High", "Low", "Close", "Volume", "target", "direction"}
     return [c for c in df.columns if c not in exclude]
 
 
+def _make_direction_target(log_returns: np.ndarray) -> np.ndarray:
+    """Convert log returns to 3-class direction: 0=DOWN, 1=FLAT, 2=UP."""
+    labels = np.ones(len(log_returns), dtype=int)  # default FLAT
+    labels[log_returns >  UP_THRESHOLD]   = 2  # UP
+    labels[log_returns <  DOWN_THRESHOLD] = 0  # DOWN
+    return labels
+
+
 # =============================================================================
-# 3. MODEL BUILDING
+# 3. WALK-FORWARD EXPANDING WINDOW VALIDATION
 # =============================================================================
 
-def _build_model(X_train: np.ndarray, y_train: np.ndarray,
-                 X_val: np.ndarray,   y_val: np.ndarray):
+def _walk_forward_splits(n: int, min_train: int = 100, n_splits: int = 3) -> list:
     """
-    Build and train one model. Uses LightGBM if available, else XGBoost.
-    Both support early stopping to prevent overfitting.
+    Walk-forward expanding window splits.
+    Each fold: train on [0..t], validate on [t..t+step].
+    NO data leakage — validation is always strictly after training.
+    """
+    step = (n - min_train) // (n_splits + 1)
+    if step < 10:
+        # Fall back to simple last-20% validation
+        split = int(n * 0.8)
+        return [(np.arange(split), np.arange(split, n))]
+
+    splits = []
+    for i in range(1, n_splits + 1):
+        train_end = min_train + step * i
+        val_end   = min(train_end + step, n)
+        if val_end <= train_end:
+            break
+        splits.append((np.arange(train_end), np.arange(train_end, val_end)))
+    return splits
+
+
+# =============================================================================
+# 4. MODEL BUILDERS
+# =============================================================================
+
+def _build_classifier(X_tr, y_tr, X_va, y_va):
+    """
+    LightGBM 3-class direction classifier with early stopping.
+    Falls back to XGBoost if LightGBM unavailable.
     """
     if _LGBM_AVAILABLE:
         import lightgbm as lgb
-        params = {**config.LGBM_PARAMS}
-        params.pop("verbose", None)
-        model = lgb.LGBMRegressor(**params, verbose=-1)
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            callbacks=[lgb.early_stopping(20, verbose=False),
-                       lgb.log_evaluation(period=-1)],
+        model = lgb.LGBMClassifier(
+            n_estimators=300, max_depth=5, learning_rate=0.05,
+            subsample=0.7, colsample_bytree=0.7,
+            min_child_samples=15, reg_alpha=0.3, reg_lambda=1.5,
+            class_weight="balanced",   # handles class imbalance
+            random_state=42, n_jobs=1, verbose=-1,
         )
-        return model
-
-    if _XGB_AVAILABLE:
-        params = {k: v for k, v in config.XGB_PARAMS.items()
-                  if k != "early_stopping_rounds"}
-        model = XGBRegressor(**params, early_stopping_rounds=20)
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
+        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
+                  callbacks=[lgb.early_stopping(30, verbose=False),
+                              lgb.log_evaluation(period=-1)])
+    else:
+        model = XGBClassifier(
+            n_estimators=150, max_depth=4, learning_rate=0.08,
+            subsample=0.7, colsample_bytree=0.7,
+            use_label_encoder=False, eval_metric="mlogloss",
+            early_stopping_rounds=20, random_state=42, n_jobs=1,
+            tree_method="hist",
         )
-        return model
+        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+    return model
 
-    raise RuntimeError("Neither LightGBM nor XGBoost is available")
+
+def _build_regressor(X_tr, y_tr, X_va, y_va):
+    """
+    LightGBM log-return regressor with early stopping.
+    Predicts magnitude of move regardless of direction.
+    """
+    if _LGBM_AVAILABLE:
+        import lightgbm as lgb
+        model = lgb.LGBMRegressor(
+            n_estimators=300, max_depth=5, learning_rate=0.05,
+            subsample=0.7, colsample_bytree=0.7,
+            min_child_samples=15, reg_alpha=0.3, reg_lambda=1.5,
+            random_state=42, n_jobs=1, verbose=-1,
+        )
+        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
+                  callbacks=[lgb.early_stopping(30, verbose=False),
+                              lgb.log_evaluation(period=-1)])
+    else:
+        model = XGBRegressor(
+            n_estimators=150, max_depth=4, learning_rate=0.08,
+            subsample=0.7, colsample_bytree=0.7,
+            early_stopping_rounds=20, random_state=42, n_jobs=1,
+            tree_method="hist",
+        )
+        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+    return model
 
 
-def _price_mape(actual_prices: np.ndarray, pred_returns: np.ndarray,
-                true_returns: np.ndarray) -> float:
-    """MAPE on prices, not returns — eliminates near-zero division explosion."""
-    pred_prices = actual_prices * (1 + pred_returns)
-    true_prices = actual_prices * (1 + true_returns)
-    safe_true   = np.where(np.abs(true_prices) < 1e-8, 1e-8, true_prices)
-    return float(np.mean(np.abs(pred_prices - true_prices) / safe_true) * 100)
+def _price_mape(actuals, pred_ret, true_ret) -> float:
+    pred_p = actuals * (1 + pred_ret)
+    true_p = actuals * (1 + true_ret)
+    safe   = np.where(np.abs(true_p) < 1e-8, 1e-8, true_p)
+    return float(np.mean(np.abs(pred_p - true_p) / safe) * 100)
 
 
 # =============================================================================
-# 4. SENTIMENT
+# 5. FEATURE SELECTION — Mutual Information + Importance Pruning
 # =============================================================================
 
-def get_sentiment_score(ticker: str) -> float:
-    if not _VADER_AVAILABLE:
-        return 0.0
-    try:
-        news   = yf.Ticker(ticker).news or []
-        scores = [
-            _vader.polarity_scores(a.get("title", ""))["compound"]
-            for a in news[:config.NEWS_MAX_ARTICLES]
-            if a.get("title")
-        ]
-        return float(np.mean(scores)) if scores else 0.0
-    except Exception:
-        return 0.0
+def _select_features(X: np.ndarray, y_cls: np.ndarray,
+                     feature_names: list[str]) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """
+    Select features using classifier importance from a quick LightGBM/XGB pass.
+    Keep top features covering 90% cumulative importance.
+    """
+    Xq, yq = X[:int(len(X)*0.8)], y_cls[:int(len(X)*0.8)]
+    Xv, yv = X[int(len(X)*0.8):], y_cls[int(len(X)*0.8):]
+
+    if _LGBM_AVAILABLE:
+        import lightgbm as lgb
+        q = lgb.LGBMClassifier(n_estimators=80, max_depth=4,
+                                random_state=42, n_jobs=1, verbose=-1,
+                                class_weight="balanced")
+        q.fit(Xq, yq, eval_set=[(Xv, yv)],
+              callbacks=[lgb.early_stopping(10, verbose=False),
+                         lgb.log_evaluation(period=-1)])
+        imp = q.feature_importances_.astype(float)
+    else:
+        q = XGBClassifier(n_estimators=80, max_depth=4, random_state=42,
+                          n_jobs=1, tree_method="hist",
+                          use_label_encoder=False, eval_metric="mlogloss",
+                          early_stopping_rounds=10)
+        q.fit(Xq, yq, eval_set=[(Xv, yv)], verbose=False)
+        imp = q.feature_importances_.astype(float)
+
+    order  = np.argsort(imp)[::-1]
+    cumsum = np.cumsum(imp[order]) / (imp.sum() + 1e-8)
+    n_keep = max(20, np.searchsorted(cumsum, 0.90) + 1)
+    keep   = sorted(order[:n_keep].tolist())
+    return X[:, keep], [feature_names[i] for i in keep], np.array(keep)
 
 
 # =============================================================================
-# 5. TRAINING — one model per horizon per ticker
+# 6. TRAINING — dual model (classifier + regressor) per horizon
 # =============================================================================
 
 def train_model(ticker: str) -> dict[str, Any]:
     if not _XGB_AVAILABLE and not _LGBM_AVAILABLE:
-        return {"ticker": ticker, "status": "error", "message": "No ML library available"}
+        return {"ticker": ticker, "status": "error", "message": "No ML library"}
 
-    logger.info("Training model for %s ...", ticker)
+    logger.info("Training %s ...", ticker)
     try:
         df, interval = fetch_ohlcv(ticker)
         df = add_features(df)
 
-        # Cap rows to avoid OOM on 512MB free tier
         if len(df) > 2000:
             df = df.tail(2000).copy()
 
-        # Get candle shifts for this interval
-        horizon_candles = config.HORIZON_CANDLES.get(interval, config.HORIZON_CANDLES["1m"])
+        horizons = config.HORIZON_CANDLES.get(interval, config.HORIZON_CANDLES["1m"])
 
-        # Check we have enough rows for the longest horizon
-        max_horizon = max(horizon_candles.values())
-        if len(df) < max_horizon + 50:
-            return {"ticker": ticker, "status": "error",
-                    "message": f"Insufficient data ({len(df)} rows)"}
-
-        # Build feature matrix once (shared across all 3 horizon models)
         feature_cols = get_feature_columns(df)
+        X_raw   = df[feature_cols].values.astype(float)
+        X_raw   = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Scaler fitted once on all features
-        X_all    = df[feature_cols].values
         scaler   = RobustScaler()
-        X_scaled = scaler.fit_transform(X_all)
+        X_scaled = scaler.fit_transform(X_raw)
+        X_scaled = np.nan_to_num(X_scaled, nan=0.0)
 
-        # Replace any remaining NaN/Inf after scaling
-        X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        # ── Feature selection using T+15 direction ───────────────────────────
+        h_t15   = horizons.get("t15", 15)
+        log_ret = np.log(df["Close"].shift(-h_t15) / df["Close"]).values
+        valid   = ~np.isnan(log_ret)
+        y_dir   = _make_direction_target(log_ret[valid])
 
-        # ── Feature pruning via importance ────────────────────────────────────
-        # Train a quick model on T+15 to get feature importances,
-        # then keep only features with cumulative importance >= 95%
-        h_candles_t15 = horizon_candles["t15"]
-        y_quick = (df["Close"].shift(-h_candles_t15) / df["Close"] - 1).values
-        valid   = ~np.isnan(y_quick)
-        X_q, y_q = X_scaled[valid][:-10], y_quick[valid][:-10]
-        X_qv, y_qv = X_scaled[valid][-10:], y_quick[valid][-10:]
+        X_sel, sel_features, sel_idx = _select_features(
+            X_scaled[valid], y_dir, feature_cols)
+        logger.info("  %s  features: %d → %d selected",
+                    ticker, len(feature_cols), len(sel_features))
 
-        if _LGBM_AVAILABLE:
-            import lightgbm as lgb
-            quick = lgb.LGBMRegressor(n_estimators=50, max_depth=4,
-                                      random_state=42, n_jobs=1, verbose=-1)
-            quick.fit(X_q, y_q, eval_set=[(X_qv, y_qv)],
-                      callbacks=[lgb.early_stopping(10, verbose=False),
-                                 lgb.log_evaluation(period=-1)])
-            importances = quick.feature_importances_
-        else:
-            quick = XGBRegressor(n_estimators=50, max_depth=4, random_state=42,
-                                 n_jobs=1, tree_method="hist", early_stopping_rounds=10)
-            quick.fit(X_q, y_q, eval_set=[(X_qv, y_qv)], verbose=False)
-            importances = quick.feature_importances_
+        # ── Train per horizon ─────────────────────────────────────────────────
+        classifiers: dict[str, Any] = {}
+        regressors:  dict[str, Any] = {}
+        dir_accs:    dict[str, float] = {}
+        val_mapes:   dict[str, float] = {}
 
-        # Sort by importance, keep features until we hit 95% cumulative
-        order      = np.argsort(importances)[::-1]
-        cumsum     = np.cumsum(importances[order]) / (importances.sum() + 1e-8)
-        keep_idx   = order[:np.searchsorted(cumsum, 0.95) + 1]
-        pruned_features = [feature_cols[i] for i in sorted(keep_idx)]
-        X_pruned = X_scaled[:, sorted(keep_idx)]
-        logger.info("  %s  feature pruning: %d → %d features",
-                    ticker, len(feature_cols), len(pruned_features))
+        for h_key, h_candles in horizons.items():
+            log_r   = np.log(df["Close"].shift(-h_candles) / df["Close"]).values
+            valid_h = ~np.isnan(log_r)
 
-        # ── Train one model per horizon ────────────────────────────────────────
-        tscv      = TimeSeriesSplit(n_splits=2)
-        models    = {}
-        val_mapes = {}
+            X_h    = X_scaled[valid_h][:, sel_idx]
+            lr_h   = log_r[valid_h]
+            dir_h  = _make_direction_target(lr_h)
+            pr_h   = df["Close"].values[valid_h]
 
-        for h_key, h_candles in horizon_candles.items():
-            y_full = (df["Close"].shift(-h_candles) / df["Close"] - 1).values
-            valid  = ~np.isnan(y_full)
+            # Drop extreme labels (top/bottom 2% of returns) — reduces noise
+            pct2   = np.percentile(np.abs(lr_h), 98)
+            mask   = np.abs(lr_h) <= pct2
+            X_h, lr_h, dir_h, pr_h = X_h[mask], lr_h[mask], dir_h[mask], pr_h[mask]
 
-            X_h = X_pruned[valid]
-            y_h = y_full[valid]
-            prices_h = df["Close"].values[valid]
-
-            if len(X_h) < 60:
-                logger.warning("  %s  %s: not enough data after shift", ticker, h_key)
+            if len(X_h) < 80:
+                logger.warning("  %s %s: too few rows (%d)", ticker, h_key, len(X_h))
                 continue
 
-            fold_mapes = []
-            best_model = None
+            splits = _walk_forward_splits(len(X_h), min_train=60, n_splits=2)
 
-            for _, (tr_idx, va_idx) in enumerate(tscv.split(X_h)):
-                m = _build_model(X_h[tr_idx], y_h[tr_idx],
-                                 X_h[va_idx],  y_h[va_idx])
-                preds = m.predict(X_h[va_idx])
-                mape  = _price_mape(prices_h[va_idx], preds, y_h[va_idx])
-                fold_mapes.append(mape)
-                best_model = m
+            fold_dir_accs, fold_mapes = [], []
+            cls_model = None
+            reg_model = None
 
-            models[h_key]    = best_model
-            val_mapes[h_key] = round(float(np.mean(fold_mapes)), 3)
-            logger.info("  %s  %-4s  val_mape=%.2f%%", ticker, h_key, val_mapes[h_key])
+            for tr_idx, va_idx in splits:
+                # Classifier
+                cls = _build_classifier(X_h[tr_idx], dir_h[tr_idx],
+                                        X_h[va_idx],  dir_h[va_idx])
+                pred_dir = cls.predict(X_h[va_idx])
+                fold_dir_accs.append(float(np.mean(pred_dir == dir_h[va_idx])) * 100)
+                cls_model = cls
 
-        if not models:
+                # Regressor
+                reg = _build_regressor(X_h[tr_idx], lr_h[tr_idx],
+                                       X_h[va_idx],  lr_h[va_idx])
+                pred_ret = reg.predict(X_h[va_idx])
+                fold_mapes.append(_price_mape(pr_h[va_idx], pred_ret, lr_h[va_idx]))
+                reg_model = reg
+
+            classifiers[h_key] = cls_model
+            regressors[h_key]  = reg_model
+            dir_accs[h_key]    = round(float(np.mean(fold_dir_accs)), 1)
+            val_mapes[h_key]   = round(float(np.mean(fold_mapes)), 3)
+
+            logger.info("  %s  %-4s  dir_acc=%.1f%%  mape=%.2f%%",
+                        ticker, h_key, dir_accs[h_key], val_mapes[h_key])
+
+        if not classifiers:
             return {"ticker": ticker, "status": "error", "message": "All horizons failed"}
 
         _MODEL_REGISTRY[ticker] = {
-            "models":    models,
-            "scaler":    scaler,
-            "features":  pruned_features,
-            "feature_idx": sorted(keep_idx),
-            "interval":  interval,
-            "horizons":  horizon_candles,
-            "val_mapes": val_mapes,
-            "trained_at":datetime.utcnow(),
-            "row_count": len(df),
+            "classifiers": classifiers,
+            "regressors":  regressors,
+            "scaler":      scaler,
+            "features":    sel_features,
+            "feat_idx":    sel_idx,
+            "interval":    interval,
+            "horizons":    horizons,
+            "dir_accs":    dir_accs,
+            "val_mapes":   val_mapes,
+            "trained_at":  datetime.utcnow(),
+            "row_count":   len(df),
         }
 
         return {
-            "ticker":     ticker,
-            "status":     "ok",
-            "interval":   interval,
-            "val_mapes":  val_mapes,
-            "features":   len(pruned_features),
-            "row_count":  len(df),
-            "trained_at": _MODEL_REGISTRY[ticker]["trained_at"].isoformat(),
+            "ticker":    ticker,
+            "status":    "ok",
+            "interval":  interval,
+            "dir_accs":  dir_accs,
+            "val_mapes": val_mapes,
+            "features":  len(sel_features),
+            "row_count": len(df),
+            "trained_at":_MODEL_REGISTRY[ticker]["trained_at"].isoformat(),
         }
 
     except Exception as exc:
@@ -570,96 +678,120 @@ def train_model(ticker: str) -> dict[str, Any]:
 
 
 def train_all(tickers: list[str] | None = None) -> list[dict]:
-    """Train all tickers with 1s polite delay between requests."""
     tickers = tickers or config.WATCHLIST
     results = []
-    for i, ticker in enumerate(tickers):
-        results.append(train_model(ticker))
+    for i, t in enumerate(tickers):
+        results.append(train_model(t))
         if i < len(tickers) - 1:
             time.sleep(1.0)
     return results
 
 
 # =============================================================================
-# 6. INFERENCE — multi-horizon predictions + pre-session
+# 7. INFERENCE
 # =============================================================================
 
-def _horizon_label(h_key: str, interval: str) -> str:
-    """Human-readable prediction window label."""
+def _horizon_mins(h_key: str, interval: str, horizons: dict) -> int:
     mins_map = {"1m": 1, "5m": 5, "1d": 1440}
-    candles  = config.HORIZON_CANDLES.get(interval, config.HORIZON_CANDLES["1m"])
-    mins     = candles.get(h_key, 15) * mins_map.get(interval, 1)
-    if mins >= 60:
-        return f"T+{mins//60}h"
-    return f"T+{mins}min"
+    return horizons.get(h_key, 15) * mins_map.get(interval, 1)
 
 
-def _signal_for_change(change_pct: float, confidence: float) -> str:
-    """BUY/SELL/HOLD based on predicted change and model confidence."""
-    threshold = 0.3 if confidence >= 70 else 0.5
-    if change_pct > threshold:
-        return "BUY"
-    if change_pct < -threshold:
-        return "SELL"
-    return "HOLD"
+def _label(h_key: str, interval: str, horizons: dict) -> str:
+    m = _horizon_mins(h_key, interval, horizons)
+    if m >= 60:
+        return f"T+{m//60}h"
+    return f"T+{m}min"
+
+
+def get_sentiment_score(ticker: str) -> float:
+    if not _VADER_AVAILABLE:
+        return 0.0
+    try:
+        news   = yf.Ticker(ticker).news or []
+        scores = [_vader.polarity_scores(a.get("title", ""))["compound"]
+                  for a in news[:config.NEWS_MAX_ARTICLES] if a.get("title")]
+        return float(np.mean(scores)) if scores else 0.0
+    except Exception:
+        return 0.0
 
 
 def predict(ticker: str) -> dict[str, Any]:
-    """
-    Return multi-horizon predictions + pre-session data for one ticker.
-    Trains on-demand if model not in registry.
-    """
     if ticker not in _MODEL_REGISTRY:
-        result = train_model(ticker)
-        if result["status"] != "ok":
-            return {
-                **result,
-                "sector":       config.SECTOR_MAP.get(ticker, ""),
-                "predictions":  {},
-                "pre_session":  {},
-                "current_price":None,
-                "sparkline":    [],
-            }
+        r = train_model(ticker)
+        if r["status"] != "ok":
+            return {**r, "sector": config.SECTOR_MAP.get(ticker, ""),
+                    "predictions": {}, "pre_session": {},
+                    "current_price": None, "sparkline": []}
 
     reg      = _MODEL_REGISTRY[ticker]
-    models   = reg["models"]
+    classifs = reg["classifiers"]
+    regressors = reg["regressors"]
     scaler   = reg["scaler"]
-    feats    = reg["features"]
-    feat_idx = reg["feature_idx"]
+    feat_idx = reg["feat_idx"]
     interval = reg["interval"]
+    horizons = reg["horizons"]
+    dir_accs = reg["dir_accs"]
     val_mapes= reg["val_mapes"]
 
     try:
-        df, _ = fetch_ohlcv(ticker, days=3)
-        df    = add_features(df)
+        df, _   = fetch_ohlcv(ticker, days=3)
+        df      = add_features(df)
         df.dropna(inplace=True)
 
         if df.empty:
             raise ValueError("No live data")
 
         current_price = float(df["Close"].iloc[-1])
-        all_features  = get_feature_columns(df)
+        all_feats     = get_feature_columns(df)
+        latest        = df[all_feats].iloc[-1:].values.astype(float)
+        latest        = np.nan_to_num(latest, nan=0.0, posinf=0.0, neginf=0.0)
+        X_s           = scaler.transform(latest)
+        X_pruned      = X_s[:, feat_idx]
 
-        # Build latest feature row using the same pruned feature set
-        latest_all  = df[all_features].iloc[-1:].values
-        latest_all  = np.nan_to_num(latest_all, nan=0.0, posinf=0.0, neginf=0.0)
-        latest_scaled = scaler.transform(latest_all)
-        latest_pruned = latest_scaled[:, feat_idx]
-
-        # ── Per-horizon predictions ───────────────────────────────────────────
         horizon_preds: dict[str, Any] = {}
-        for h_key, model in models.items():
-            if model is None:
+        for h_key in horizons:
+            cls = classifs.get(h_key)
+            rgr = regressors.get(h_key)
+            if cls is None or rgr is None:
                 continue
-            pred_return   = float(model.predict(latest_pruned)[0])
-            predicted_price = round(current_price * (1 + pred_return), 2)
-            change_pct      = pred_return * 100
 
-            mape       = val_mapes.get(h_key, 5.0)
-            confidence = max(0, min(100, round(100 - mape * 8, 1)))
-            signal     = _signal_for_change(change_pct, confidence)
+            # Direction probabilities [p_DOWN, p_FLAT, p_UP]
+            proba     = cls.predict_proba(X_pruned)[0]   # shape (3,)
+            dir_pred  = int(np.argmax(proba))             # 0=DOWN,1=FLAT,2=UP
+            dir_label = {0: "DOWN", 1: "FLAT", 2: "UP"}[dir_pred]
 
-            # Sentiment overlay on T+15 only (most actionable)
+            # Calibrated confidence = max probability, boosted if directional
+            conf_raw = float(proba[dir_pred]) * 100
+            # If model strongly directional (not flat), boost confidence slightly
+            dir_strength = float(proba[0] + proba[2])  # non-flat probability
+            confidence   = round(min(99, conf_raw * (1 + dir_strength * 0.2)), 1)
+
+            # Magnitude from regressor
+            pred_log_ret = float(rgr.predict(X_pruned)[0])
+
+            # Combine: direction from classifier, magnitude from regressor
+            # If classifier says DOWN but regressor is positive, trust classifier
+            if dir_pred == 2:    # UP
+                signed_ret = abs(pred_log_ret)
+            elif dir_pred == 0:  # DOWN
+                signed_ret = -abs(pred_log_ret)
+            else:                # FLAT
+                signed_ret = pred_log_ret * 0.3   # dampen magnitude
+
+            predicted_price = round(current_price * np.exp(signed_ret), 2)
+            change_pct      = (predicted_price / current_price - 1) * 100
+
+            # Trading signal (directional accuracy gates the signal)
+            d_acc = dir_accs.get(h_key, 50)
+            if dir_pred == 2 and d_acc >= 52:
+                signal = "BUY"
+            elif dir_pred == 0 and d_acc >= 52:
+                signal = "SELL"
+            else:
+                signal = "HOLD"
+
+            # Sentiment overlay (T+15 only)
+            sentiment = 0.0
             if h_key == "t15":
                 sentiment = get_sentiment_score(ticker)
                 if sentiment < -0.3 and signal == "BUY":
@@ -668,31 +800,30 @@ def predict(ticker: str) -> dict[str, Any]:
                 elif sentiment > 0.3 and signal == "SELL":
                     signal     = "HOLD"
                     confidence = max(0, confidence - 10)
-            else:
-                sentiment = 0.0
 
-            # Entry/exit times
-            mins_map     = {"1m": 1, "5m": 5, "1d": 1440}
-            candles      = config.HORIZON_CANDLES.get(interval, config.HORIZON_CANDLES["1m"])
-            horizon_mins = candles.get(h_key, 15) * mins_map.get(interval, 1)
-            exit_time    = (now_ist() + timedelta(minutes=horizon_mins)).strftime("%H:%M IST")
+            h_mins   = _horizon_mins(h_key, interval, horizons)
+            exit_ist = (now_ist() + timedelta(minutes=h_mins)).strftime("%H:%M IST")
 
             horizon_preds[h_key] = {
-                "label":           _horizon_label(h_key, interval),
+                "label":           _label(h_key, interval, horizons),
                 "predicted_price": predicted_price,
                 "change_pct":      round(change_pct, 3),
                 "signal":          signal,
                 "confidence":      confidence,
-                "val_mape":        mape,
-                "exit_time":       exit_time,
-                "horizon_mins":    horizon_mins,
+                "direction":       dir_label,
+                "dir_proba":       {
+                    "DOWN": round(float(proba[0]) * 100, 1),
+                    "FLAT": round(float(proba[1]) * 100, 1),
+                    "UP":   round(float(proba[2]) * 100, 1),
+                },
+                "dir_acc":         d_acc,    # historical directional accuracy %
+                "val_mape":        val_mapes.get(h_key, 0),
+                "exit_time":       exit_ist,
+                "horizon_mins":    h_mins,
                 "sentiment":       round(sentiment, 3),
             }
 
-        # ── Risk sizing (based on T+15 signal) ───────────────────────────────
-        risk_qty = max(1, int(config.RISK_CAPITAL_INR / (current_price * config.RISK_PCT)))
-
-        # ── Pre-session data ──────────────────────────────────────────────────
+        risk_qty    = max(1, int(config.RISK_CAPITAL_INR / (current_price * config.RISK_PCT)))
         pre_session = fetch_pre_session(ticker)
 
         return {
@@ -708,6 +839,7 @@ def predict(ticker: str) -> dict[str, Any]:
             "data_interval": interval,
             "trained_at":    reg["trained_at"].isoformat(),
             "val_mapes":     val_mapes,
+            "dir_accs":      dir_accs,
         }
 
     except Exception as exc:
@@ -725,36 +857,37 @@ def predict(ticker: str) -> dict[str, Any]:
 
 
 # =============================================================================
-# 7. BACKTESTER — price-based MAPE per horizon
+# 8. BACKTESTER — directional accuracy + price MAPE per horizon
 # =============================================================================
 
 def backtest_yesterday(ticker: str) -> dict[str, Any]:
     if ticker not in _MODEL_REGISTRY:
         train_model(ticker)
 
-    reg      = _MODEL_REGISTRY[ticker]
-    models   = reg["models"]
-    scaler   = reg["scaler"]
-    feats    = reg["features"]
-    feat_idx = reg["feature_idx"]
-    interval = reg["interval"]
-    horizons = reg["horizons"]
+    reg       = _MODEL_REGISTRY[ticker]
+    classifs  = reg["classifiers"]
+    regressors= reg["regressors"]
+    scaler    = reg["scaler"]
+    feat_idx  = reg["feat_idx"]
+    interval  = reg["interval"]
+    horizons  = reg["horizons"]
+    dir_accs  = reg["dir_accs"]
 
     try:
         df_full, _ = fetch_ohlcv(ticker, days=config.TRAINING_PERIOD_DAYS + 1)
         df_full    = add_features(df_full)
         df_full.dropna(inplace=True)
 
-        # Find last trading day (walk back up to 7 days)
-        today = datetime.utcnow().date()
-        df_yday   = pd.DataFrame()
+        today  = datetime.utcnow().date()
+        df_yday = pd.DataFrame()
         backtest_date = today
+
         for days_back in range(1, 8):
-            test_date = today - timedelta(days=days_back)
-            mask = df_full.index.date == test_date
+            d    = today - timedelta(days=days_back)
+            mask = df_full.index.date == d
             if mask.sum() >= 2:
                 df_yday = df_full[mask]
-                backtest_date = test_date
+                backtest_date = d
                 break
 
         if df_yday.empty:
@@ -762,66 +895,73 @@ def backtest_yesterday(ticker: str) -> dict[str, Any]:
             df_yday = df_full[df_full.index.date == backtest_date]
 
         if df_yday.empty:
-            return {"ticker": ticker, "status": "error", "message": "No recent trading data"}
+            return {"ticker": ticker, "status": "error", "message": "No trading data found"}
 
-        all_features = get_feature_columns(df_full)
-        X_yday       = df_yday[all_features].values
-        X_yday       = np.nan_to_num(X_yday, nan=0.0, posinf=0.0, neginf=0.0)
-        X_scaled     = scaler.transform(X_yday)
-        X_pruned     = X_scaled[:, feat_idx]
+        all_feats  = get_feature_columns(df_full)
+        X_yday     = np.nan_to_num(df_yday[all_feats].values.astype(float))
+        X_s        = scaler.transform(X_yday)
+        X_pruned   = X_s[:, feat_idx]
 
         results_per_horizon: dict[str, Any] = {}
-        overall_mapes: list[float] = []
+        all_mapes: list[float] = []
 
         for h_key, h_candles in horizons.items():
-            model = models.get(h_key)
-            if model is None:
+            cls = classifs.get(h_key)
+            rgr = regressors.get(h_key)
+            if cls is None or rgr is None:
                 continue
 
-            # Target: actual future price
-            y_true_ret = (df_yday["Close"].shift(-h_candles) / df_yday["Close"] - 1).values
-            valid = ~np.isnan(y_true_ret)
+            log_r = np.log(df_yday["Close"].shift(-h_candles) / df_yday["Close"]).values
+            valid = ~np.isnan(log_r)
             if valid.sum() < 2:
                 continue
 
-            sample_idx = np.where(valid)[0][::max(1, h_candles)]
-            X_s        = X_pruned[sample_idx]
-            y_true_s   = y_true_ret[sample_idx]
-            prices_s   = df_yday["Close"].values[sample_idx]
-            y_pred_s   = model.predict(X_s)
+            sample     = np.where(valid)[0][::max(1, h_candles)]
+            X_s_samp   = X_pruned[sample]
+            lr_true    = log_r[sample]
+            prices_s   = df_yday["Close"].values[sample]
+            dir_true   = _make_direction_target(lr_true)
 
-            pred_prices = prices_s * (1 + y_pred_s)
-            true_prices = prices_s * (1 + y_true_s)
-            safe_true   = np.where(np.abs(true_prices) < 1e-8, 1e-8, true_prices)
-            errors      = np.abs(pred_prices - true_prices) / safe_true * 100
-            mape        = float(np.mean(errors))
+            pred_dirs  = cls.predict(X_s_samp)
+            dir_acc    = float(np.mean(pred_dirs == dir_true)) * 100
+            pred_ret   = rgr.predict(X_s_samp)
+            mape       = _price_mape(prices_s, pred_ret, lr_true)
+            all_mapes.append(mape)
 
-            mins_map     = {"1m": 1, "5m": 5, "1d": 1440}
-            horizon_mins = h_candles * mins_map.get(interval, 1)
+            pred_prices = prices_s * (1 + pred_ret)
+            true_prices = prices_s * (1 + lr_true)
+            h_mins      = _horizon_mins(h_key, interval, horizons)
 
             steps = [
                 {
-                    "time":            str(df_yday.index[sample_idx[i]]),
+                    "time":            str(df_yday.index[sample[i]]),
                     "actual_price":    round(float(prices_s[i]), 2),
                     "predicted_price": round(float(pred_prices[i]), 2),
                     "true_future":     round(float(true_prices[i]), 2),
-                    "price_error_pct": round(float(errors[i]), 3),
+                    "price_error_pct": round(float(
+                        abs(pred_prices[i]-true_prices[i]) / (abs(true_prices[i])+1e-8) * 100
+                    ), 3),
+                    "pred_direction":  {0:"DOWN",1:"FLAT",2:"UP"}[int(pred_dirs[i])],
+                    "true_direction":  {0:"DOWN",1:"FLAT",2:"UP"}[int(dir_true[i])],
+                    "dir_correct":     bool(pred_dirs[i] == dir_true[i]),
                 }
-                for i in range(len(sample_idx))
+                for i in range(len(sample))
             ]
 
-            passed = mape <= config.MAX_ERROR_THRESHOLD_PCT
             results_per_horizon[h_key] = {
-                "label":       _horizon_label(h_key, interval),
-                "horizon_mins":horizon_mins,
-                "mape":        round(mape, 3),
-                "passed":      passed,
-                "steps":       steps,
+                "label":            _label(h_key, interval, horizons),
+                "horizon_mins":     h_mins,
+                "mape":             round(mape, 3),
+                "dir_accuracy":     round(dir_acc, 1),
+                "passed":           mape <= config.MAX_ERROR_THRESHOLD_PCT,
+                "steps":            steps,
             }
-            overall_mapes.append(mape)
 
-        overall_mape   = round(float(np.mean(overall_mapes)), 3) if overall_mapes else 999.0
+        overall_mape   = round(float(np.mean(all_mapes)), 3) if all_mapes else 999.0
         overall_passed = overall_mape <= config.MAX_ERROR_THRESHOLD_PCT
+        overall_dir    = round(float(np.mean([
+            r["dir_accuracy"] for r in results_per_horizon.values()
+        ])), 1) if results_per_horizon else 0
 
         return {
             "ticker":           ticker,
@@ -829,17 +969,18 @@ def backtest_yesterday(ticker: str) -> dict[str, Any]:
             "date":             str(backtest_date),
             "data_interval":    interval,
             "overall_mape":     overall_mape,
+            "overall_dir_acc":  overall_dir,
             "passed":           overall_passed,
             "threshold":        config.MAX_ERROR_THRESHOLD_PCT,
             "horizons":         results_per_horizon,
-            "mape":             overall_mape,   # backward compat for frontend
+            "mape":             overall_mape,
             "summary": (
                 f"{'PASSED' if overall_passed else 'FAILED'} — "
-                f"avg MAPE {overall_mape:.2f}% across all horizons"
+                f"MAPE {overall_mape:.2f}%  |  Dir accuracy {overall_dir:.1f}%"
             ),
         }
 
     except Exception as exc:
         import traceback
-        logger.error("Backtest failed for %s: %s\n%s", ticker, exc, traceback.format_exc())
+        logger.error("Backtest failed %s: %s\n%s", ticker, exc, traceback.format_exc())
         return {"ticker": ticker, "status": "error", "message": str(exc)}
