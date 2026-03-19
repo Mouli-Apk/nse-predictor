@@ -29,12 +29,22 @@ const TABS = [
 ]
 
 // ── Summary strip ─────────────────────────────────────────────────────────────
+// Helper: get primary (T+15) signal/confidence from either old or new format
+function getPrimary(p) {
+  const t15 = p?.predictions?.t15
+  return {
+    signal:     t15?.signal     ?? p?.signal     ?? 'HOLD',
+    confidence: t15?.confidence ?? p?.confidence ?? 0,
+    change_pct: t15?.change_pct ?? p?.change_pct ?? 0,
+  }
+}
+
 function SummaryStrip({ predictions }) {
   if (!predictions?.length) return null
-  const buys  = predictions.filter(p => p.signal === 'BUY').length
-  const sells = predictions.filter(p => p.signal === 'SELL').length
-  const holds = predictions.filter(p => p.signal === 'HOLD').length
-  const avgConf = predictions.reduce((a, p) => a + (p.confidence || 0), 0) / predictions.length
+  const buys    = predictions.filter(p => getPrimary(p).signal === 'BUY').length
+  const sells   = predictions.filter(p => getPrimary(p).signal === 'SELL').length
+  const holds   = predictions.filter(p => getPrimary(p).signal === 'HOLD').length
+  const avgConf = predictions.length ? predictions.reduce((a, p) => a + (getPrimary(p).confidence || 0), 0) / predictions.length : 0
 
   return (
     <div style={{
@@ -228,15 +238,15 @@ export default function App() {
   const displayed = predictions
     .filter(p => {
       if (sector !== 'All' && p.sector !== sector) return false
-      if (signal !== 'All' && p.signal !== signal) return false
+      if (signal !== 'All' && getPrimary(p).signal !== signal) return false
       if (search && !p.ticker.toLowerCase().includes(search.toLowerCase())) return false
       return true
     })
     .sort((a, b) => {
       switch (sort) {
-        case 'confidence':  return (b.confidence || 0) - (a.confidence || 0)
-        case 'change_asc':  return (a.change_pct || 0) - (b.change_pct || 0)
-        case 'change_desc': return (b.change_pct || 0) - (a.change_pct || 0)
+        case 'confidence':  return (getPrimary(b).confidence || 0) - (getPrimary(a).confidence || 0)
+        case 'change_asc':  return (getPrimary(a).change_pct || 0) - (getPrimary(b).change_pct || 0)
+        case 'change_desc': return (getPrimary(b).change_pct || 0) - (getPrimary(a).change_pct || 0)
         case 'price_asc':   return (a.current_price || 0) - (b.current_price || 0)
         case 'alpha':       return a.ticker.localeCompare(b.ticker)
         default:            return 0
