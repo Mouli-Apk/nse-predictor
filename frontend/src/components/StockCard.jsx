@@ -2,8 +2,9 @@
 import { useState, useCallback } from 'react'
 import { AreaChart, Area, ResponsiveContainer, Tooltip, YAxis } from 'recharts'
 import { TrendingUp, TrendingDown, Minus, RefreshCw, Clock, Package,
-         ChevronDown, ChevronUp, Activity } from 'lucide-react'
+         ChevronDown, ChevronUp, Activity, Lock } from 'lucide-react'
 import { api } from '../api'
+import { lockPrediction } from './LockTracker'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const fmt    = (n, d = 2) => n == null ? '—'
@@ -130,7 +131,7 @@ function PreSession({ data }) {
 }
 
 // ── Horizon tab content ───────────────────────────────────────────────────────
-function HorizonPanel({ pred, currentPrice }) {
+function HorizonPanel({ pred, currentPrice, hKey, ticker, sector, onLocked }) {
   if (!pred) return (
     <div style={{ padding:'12px', textAlign:'center', color:'var(--slate-light)', fontSize:12 }}>
       Prediction not available
@@ -196,6 +197,34 @@ function HorizonPanel({ pred, currentPrice }) {
             fontWeight:700 }}>{pred.sentiment > 0 ? '+' : ''}{pred.sentiment}</span></span>
         )}
       </div>
+
+      {/* Lock button */}
+      <button
+        onClick={() => {
+          lockPrediction({
+            ticker, sector,
+            signal:          pred.signal,
+            horizon_key:     hKey,
+            horizon_label:   pred.label,
+            predicted_price: pred.predicted_price,
+            price_at_lock:   currentPrice,
+            change_pct:      pred.change_pct,
+            confidence:      pred.confidence,
+            val_mape:        pred.val_mape,
+            horizon_mins:    pred.horizon_mins,
+          })
+          onLocked && onLocked()
+        }}
+        style={{
+          marginTop: 10, width: '100%', padding: '7px 0',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+          background: 'linear-gradient(135deg,#003D99,#0052CC)',
+          color: '#fff', border: 'none', borderRadius: 7,
+          cursor: 'pointer', fontSize: 12, fontWeight: 700, letterSpacing: .5,
+        }}
+      >
+        <Lock size={12}/> Lock Prediction
+      </button>
     </div>
   )
 }
@@ -344,7 +373,14 @@ export default function StockCard({ ticker, initialData }) {
       </div>
 
       {/* Active horizon panel */}
-      <HorizonPanel pred={pred} currentPrice={data.current_price}/>
+      <HorizonPanel
+        pred={pred}
+        currentPrice={data.current_price}
+        hKey={activeH}
+        ticker={data.ticker}
+        sector={data.sector}
+        onLocked={() => window.dispatchEvent(new Event('nse-lock-added'))}
+      />
 
       {/* Expand toggle */}
       <div style={{ padding:'0 13px 12px' }}>
