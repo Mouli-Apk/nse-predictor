@@ -760,11 +760,17 @@ def predict(ticker: str) -> dict[str, Any]:
             dir_pred  = int(np.argmax(proba))             # 0=DOWN,1=FLAT,2=UP
             dir_label = {0: "DOWN", 1: "FLAT", 2: "UP"}[dir_pred]
 
-            # Calibrated confidence = max probability, boosted if directional
-            conf_raw = float(proba[dir_pred]) * 100
-            # If model strongly directional (not flat), boost confidence slightly
-            dir_strength = float(proba[0] + proba[2])  # non-flat probability
-            confidence   = round(min(99, conf_raw * (1 + dir_strength * 0.2)), 1)
+            # Normalised confidence: maps random baseline (33%) → 0%, certain (100%) → 100%
+            # Raw proba of 33% = no better than guessing = 0% confidence shown
+            # Raw proba of 67% = moderately confident = 50% confidence shown
+            # Raw proba of 90% = highly confident = 85% confidence shown
+            RANDOM_BASELINE = 1.0 / 3.0
+            conf_norm  = (float(proba[dir_pred]) - RANDOM_BASELINE) / (1.0 - RANDOM_BASELINE)
+            conf_norm  = max(0.0, conf_norm)
+            # Boost if non-flat signals are strong (model is decisively directional)
+            dir_strength = float(proba[0] + proba[2])
+            conf_boost   = 1.0 + (dir_strength - 0.5) * 0.15 if dir_strength > 0.5 else 1.0
+            confidence   = round(min(99.0, conf_norm * 100 * conf_boost), 1)
 
             # Magnitude from regressor
             pred_log_ret = float(rgr.predict(X_pruned)[0])
@@ -984,3 +990,235 @@ def backtest_yesterday(ticker: str) -> dict[str, Any]:
         import traceback
         logger.error("Backtest failed %s: %s\n%s", ticker, exc, traceback.format_exc())
         return {"ticker": ticker, "status": "error", "message": str(exc)}
+
+
+# =============================================================================
+# 9. AFTER-MARKET CLOSE ANALYSIS
+#    Runs after NSE close (3:30 PM IST). Ranks all 25 stocks for next morning.
+#    Uses today's full session data + T+1day models to build a morning watchlist.
+# =============================================================================
+
+def _market_is_closed() -> bool:
+    """True if current IST time is after 3:30 PM (NSE close) or before 9:15 AM."""
+    now   = now_ist()
+    after = (now.hour > 15) or (now.hour == 15 and now.minute >= 30)
+    before= (now.hour < 9)  or (now.hour == 9 and now.minute < 15)
+    return after or before
+
+
+def _score_stock(ticker: str) -> dict[str, Any] | None:
+    """
+    Score a single stock for next-morning pre-open session.
+    Returns a scored dict or None if data unavailable.
+    """
+    if ticker not in _MODEL_REGISTRY:
+        return None
+
+    reg      = _MODEL_REGISTRY[ticker]
+    classifs = reg.get("classifiers", {})
+    regressors= reg.get("regressors", {})
+    scaler   = reg["scaler"]
+    feat_idx = reg["feat_idx"]
+    interval = reg["interval"]
+    horizons = reg["horizons"]
+    dir_accs = reg.get("dir_accs", {})
+
+    try:
+        # Fetch today's full session OHLCV
+        df, _ = fetch_ohlcv(ticker, days=3)
+        df    = add_features(df)
+        df.dropna(inplace=True)
+
+        if df.empty or len(df) < 10:
+            return None
+
+        current_price = float(df["Close"].iloc[-1])
+        today_open    = float(df["Open"].iloc[0])   if len(df) > 0 else current_price
+        today_high    = float(df["High"].max())
+        today_low     = float(df["Low"].min())
+        today_volume  = float(df["Volume"].sum())
+        avg_volume    = float(df["Volume"].rolling(20).mean().iloc[-1]) if len(df) >= 20 else today_volume
+
+        # ── Compute prediction using T+1d (or longest available horizon) ──────
+        best_horizon = "t3h" if "t3h" in classifs else ("t1h" if "t1h" in classifs else "t15")
+        cls = classifs.get(best_horizon)
+        rgr = regressors.get(best_horizon)
+        if cls is None or rgr is None:
+            return None
+
+        all_feats = get_feature_columns(df)
+        latest    = df[all_feats].iloc[-1:].values.astype(float)
+        latest    = np.nan_to_num(latest, nan=0.0, posinf=0.0, neginf=0.0)
+        X_s       = scaler.transform(latest)
+        X_pruned  = X_s[:, feat_idx]
+
+        proba      = cls.predict_proba(X_pruned)[0]
+        dir_pred   = int(np.argmax(proba))
+        pred_ret   = float(rgr.predict(X_pruned)[0])
+
+        # Normalised confidence
+        RANDOM_BASE = 1.0 / 3.0
+        conf_norm   = max(0.0, (float(proba[dir_pred]) - RANDOM_BASE) / (1.0 - RANDOM_BASE))
+        confidence  = round(min(99.0, conf_norm * 100), 1)
+
+        # Predicted opening price (using log return from close)
+        if dir_pred == 2:
+            signed_ret = abs(pred_ret)
+        elif dir_pred == 0:
+            signed_ret = -abs(pred_ret)
+        else:
+            signed_ret = pred_ret * 0.3
+
+        pred_next_price = round(current_price * np.exp(signed_ret), 2)
+        pred_change_pct = (pred_next_price / current_price - 1) * 100
+
+        # ── Technical scoring (0-100) for morning setup ───────────────────────
+        scores = {}
+
+        # 1. Trend alignment: is price above key EMAs?
+        close_s = df["Close"]
+        ema9  = float(close_s.ewm(span=9,  adjust=False).mean().iloc[-1])
+        ema21 = float(close_s.ewm(span=21, adjust=False).mean().iloc[-1])
+        ema50 = float(close_s.ewm(span=50, adjust=False).mean().iloc[-1])
+        trend_score = sum([current_price > ema9, current_price > ema21, current_price > ema50]) / 3 * 100
+        scores["trend"] = trend_score
+
+        # 2. RSI positioning (best entry: 40-60 range, not overbought/oversold)
+        rsi_val = float(_rsi(close_s, 14).iloc[-1]) if not np.isnan(_rsi(close_s, 14).iloc[-1]) else 50
+        rsi_score = 100 - abs(rsi_val - 50) * 2   # peak at RSI=50
+        scores["rsi"] = max(0, rsi_score)
+
+        # 3. Volume surge today (high volume = conviction)
+        vol_ratio = today_volume / (avg_volume + 1e-8)
+        vol_score = min(100, vol_ratio * 40)
+        scores["volume"] = vol_score
+
+        # 4. Day's range position (close near high = bullish momentum)
+        day_range = today_high - today_low
+        if day_range > 0:
+            range_pos = (current_price - today_low) / day_range * 100
+        else:
+            range_pos = 50
+        scores["range_position"] = range_pos
+
+        # 5. Pre-open bid data
+        pre_data    = fetch_pre_session(ticker)
+        bid         = pre_data.get("bid") or current_price
+        ask         = pre_data.get("ask") or current_price
+        spread_pct  = abs(ask - bid) / (current_price + 1e-8) * 100
+        # Tight spread = liquid = good for entry
+        spread_score = max(0, 100 - spread_pct * 200)
+        scores["spread"] = spread_score
+
+        # 6. Week 52 positioning (buying near 52W low is value, near high is momentum)
+        w52_high = pre_data.get("week52_high") or current_price * 1.3
+        w52_low  = pre_data.get("week52_low")  or current_price * 0.7
+        w52_range = w52_high - w52_low
+        if w52_range > 0:
+            w52_pos = (current_price - w52_low) / w52_range * 100
+        else:
+            w52_pos = 50
+        # Prefer stocks in middle of 52W range (not at extremes)
+        w52_score = 100 - abs(w52_pos - 50) * 1.5
+        scores["week52"] = max(0, w52_score)
+
+        # 7. Model directional accuracy
+        d_acc = dir_accs.get(best_horizon, 50)
+        scores["model_acc"] = (d_acc - 50) * 2   # 50% → 0, 75% → 50, 100% → 100
+
+        # ── Composite score ───────────────────────────────────────────────────
+        weights = {"trend":0.20, "rsi":0.10, "volume":0.20, "range_position":0.15,
+                   "spread":0.10, "week52":0.10, "model_acc":0.15}
+        composite = sum(scores.get(k,0) * w for k, w in weights.items())
+
+        # Only recommend if model predicts UP direction with decent confidence
+        actionable = (dir_pred == 2 and confidence >= 35 and composite >= 40)
+
+        # Buy range: suggest entry between bid and 0.3% above current
+        buy_low  = round(bid * 0.998, 2) if bid else round(current_price * 0.997, 2)
+        buy_high = round(current_price * 1.003, 2)
+        stop_loss = round(current_price * (1 - config.RISK_PCT), 2)
+        target    = pred_next_price
+
+        return {
+            "ticker":          ticker,
+            "sector":          config.SECTOR_MAP.get(ticker, ""),
+            "current_price":   current_price,
+            "predicted_price": pred_next_price,
+            "predicted_change_pct": round(pred_change_pct, 2),
+            "direction":       {0:"DOWN",1:"FLAT",2:"UP"}[dir_pred],
+            "confidence":      confidence,
+            "composite_score": round(composite, 1),
+            "actionable":      actionable,
+            "buy_range":       {"low": buy_low, "high": buy_high},
+            "stop_loss":       stop_loss,
+            "target":          target,
+            "risk_qty":        max(1, int(config.RISK_CAPITAL_INR / (current_price * config.RISK_PCT))),
+            "scores":          {k: round(v, 1) for k, v in scores.items()},
+            "today_stats": {
+                "open":       round(today_open, 2),
+                "high":       round(today_high, 2),
+                "low":        round(today_low, 2),
+                "close":      round(current_price, 2),
+                "vol_ratio":  round(vol_ratio, 2),
+                "rsi":        round(rsi_val, 1),
+            },
+            "pre_session":     pre_data,
+            "data_interval":   interval,
+            "horizon_used":    best_horizon,
+        }
+
+    except Exception as exc:
+        logger.warning("  score_stock failed for %s: %s", ticker, exc)
+        return None
+
+
+def after_market_analysis(top_n: int = 7) -> dict[str, Any]:
+    """
+    Runs a full post-close analysis of all 25 stocks.
+    Returns top_n stocks ranked by composite score for next morning's pre-open.
+    Call this after 3:30 PM IST.
+    """
+    logger.info("After-market analysis started for %d tickers", len(config.WATCHLIST))
+
+    results = []
+    for ticker in config.WATCHLIST:
+        scored = _score_stock(ticker)
+        if scored:
+            results.append(scored)
+        time.sleep(0.3)  # polite delay
+
+    if not results:
+        return {
+            "status": "error",
+            "message": "No scored stocks — ensure models are trained first",
+            "stocks": [],
+        }
+
+    # Sort by composite score (descending), actionable ones first
+    results.sort(key=lambda x: (x["actionable"], x["composite_score"]), reverse=True)
+
+    actionable = [r for r in results if r["actionable"]]
+    watchlist  = results[:top_n]
+
+    now  = now_ist()
+    mkt_open_ist = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now.hour >= 15:
+        # Next trading day
+        mkt_open_ist = mkt_open_ist + timedelta(days=1)
+
+    return {
+        "status":           "ok",
+        "generated_at":     now.strftime("%d %b %Y  %H:%M IST"),
+        "market_opens":     mkt_open_ist.strftime("%d %b  %H:%M IST"),
+        "total_analysed":   len(results),
+        "actionable_count": len(actionable),
+        "top_picks":        watchlist,
+        "all_stocks":       results,
+        "summary": (
+            f"{len(actionable)} stocks show bullish setup for tomorrow. "
+            f"Top pick: {watchlist[0]['ticker'].replace('.NS','')} "
+            f"({watchlist[0]['predicted_change_pct']:+.1f}%)"
+            if watchlist else "No strong setups detected for tomorrow."
+        ),
+    }
