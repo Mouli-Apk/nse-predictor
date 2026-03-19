@@ -187,11 +187,18 @@ def scorecard() -> dict:
 def _log_prediction(result: dict) -> None:
     ticker = result.get("ticker", "")
     if ticker and result.get("status") == "ok":
+        # New multi-horizon format: read from predictions.t15 (primary horizon)
+        preds  = result.get("predictions", {})
+        t15    = preds.get("t15", {})
+        # Fallback to top-level for backward compatibility
+        conf   = t15.get("confidence") or result.get("confidence")
+        signal = t15.get("signal")     or result.get("signal", "HOLD")
+        chg    = t15.get("change_pct") or result.get("change_pct")
         _session_stats.setdefault(ticker, []).append({
             "time":       datetime.utcnow().isoformat(),
-            "change_pct": result.get("change_pct"),
-            "confidence": result.get("confidence"),
-            "signal":     result.get("signal"),
+            "change_pct": chg,
+            "confidence": conf,
+            "signal":     signal,
         })
 
 
