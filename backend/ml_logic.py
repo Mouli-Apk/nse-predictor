@@ -62,6 +62,12 @@ from sklearn.feature_selection import SelectFromModel
 
 import config
 
+# ── IST offset — all times displayed in Indian Standard Time ──────────────────
+IST = timedelta(hours=5, minutes=30)
+
+def now_ist() -> datetime:
+    return datetime.utcnow() + IST
+
 # ── In-memory model registry ───────────────────────────────────────────────────
 # Structure per ticker:
 # {
@@ -669,8 +675,7 @@ def predict(ticker: str) -> dict[str, Any]:
             mins_map     = {"1m": 1, "5m": 5, "1d": 1440}
             candles      = config.HORIZON_CANDLES.get(interval, config.HORIZON_CANDLES["1m"])
             horizon_mins = candles.get(h_key, 15) * mins_map.get(interval, 1)
-            now          = datetime.utcnow()
-            exit_time    = (now + timedelta(minutes=horizon_mins)).strftime("%H:%M")
+            exit_time    = (now_ist() + timedelta(minutes=horizon_mins)).strftime("%H:%M IST")
 
             horizon_preds[h_key] = {
                 "label":           _horizon_label(h_key, interval),
@@ -698,7 +703,7 @@ def predict(ticker: str) -> dict[str, Any]:
             "predictions":   horizon_preds,
             "pre_session":   pre_session,
             "risk_qty":      risk_qty,
-            "entry_time":    datetime.utcnow().strftime("%H:%M"),
+            "entry_time":    now_ist().strftime("%H:%M IST"),
             "sparkline":     fetch_recent_prices(ticker),
             "data_interval": interval,
             "trained_at":    reg["trained_at"].isoformat(),
