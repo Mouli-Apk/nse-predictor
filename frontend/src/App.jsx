@@ -1,13 +1,14 @@
 // App.jsx — NSE Intraday Predictor · Main Dashboard
 import { useState, useEffect, useCallback } from 'react'
 import {
-  LayoutGrid, BarChart2, Settings, RefreshCw, Lock,
+  LayoutGrid, BarChart2, Settings, RefreshCw, Lock, Moon,
   TrendingUp, TrendingDown, Minus, Search, ChevronDown,
 } from 'lucide-react'
 import Header    from './components/Header.jsx'
 import StockCard from './components/StockCard.jsx'
 import BacktestTab from './components/BacktestTab.jsx'
-import LockTracker from './components/LockTracker.jsx'
+import LockTracker  from './components/LockTracker.jsx'
+import AfterMarket  from './components/AfterMarket.jsx'
 import { api } from './api'
 
 // ── Sector filter config ──────────────────────────────────────────────────────
@@ -23,9 +24,10 @@ const SORT_OPTIONS = [
 
 // ── Tab definitions ───────────────────────────────────────────────────────────
 const TABS = [
-  { id: 'dashboard', label: 'Dashboard',   Icon: LayoutGrid },
-  { id: 'backtest',  label: 'Backtester',  Icon: BarChart2  },
-  { id: 'locktrack', label: 'Lock & Track',Icon: Lock        },
+  { id: 'dashboard',   label: 'Dashboard',     Icon: LayoutGrid },
+  { id: 'backtest',    label: 'Backtester',     Icon: BarChart2  },
+  { id: 'locktrack',   label: 'Lock & Track',   Icon: Lock        },
+  { id: 'aftermarket', label: 'After Market',   Icon: Moon        },
 ]
 
 // ── Summary strip ─────────────────────────────────────────────────────────────
@@ -289,6 +291,8 @@ export default function App() {
         <BacktestTab />
       ) : tab === 'locktrack' ? (
         <LockTracker />
+      ) : tab === 'aftermarket' ? (
+        <AfterMarket />
       ) : (
         <>
           {/* Summary strip */}
