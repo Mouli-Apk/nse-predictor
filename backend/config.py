@@ -64,9 +64,21 @@ SECTOR_MAP: dict[str, str] = {
 }
 
 # ── Model Hyperparameters ──────────────────────────────────────────────────────
-PREDICTION_HORIZON_MINS: int   = 15          # T+15 min forecast
+# Multi-horizon predictions — one XGBoost model trained per horizon per ticker
+PREDICTION_HORIZONS: dict = {
+    "t15":  {"label": "T+15 min", "mins": 15},
+    "t1h":  {"label": "T+1 Hour", "mins": 60},
+    "t3h":  {"label": "T+3 Hours","mins": 180},
+}
+# Candle shift per interval for each horizon
+# {data_interval: {horizon_key: candle_shift}}
+HORIZON_CANDLES: dict = {
+    "1m": {"t15": 15,  "t1h": 60,  "t3h": 180},
+    "5m": {"t15": 3,   "t1h": 12,  "t3h": 36},
+    "1d": {"t15": 1,   "t1h": 1,   "t3h": 2},
+}
 TRAINING_PERIOD_DAYS:    int   = 7           # rolling window
-CANDLE_INTERVAL:         str   = "1m"        # 1-minute OHLCV
+CANDLE_INTERVAL:         str   = "1m"        # preferred interval
 MAX_ERROR_THRESHOLD_PCT: float = 3.0         # accuracy gate (%)
 
 # ── Risk Engine ────────────────────────────────────────────────────────────────
@@ -83,17 +95,35 @@ BB_PERIOD:    int = 20
 BB_STD:       float = 2.0
 
 # ── XGBoost Defaults ──────────────────────────────────────────────────────────
+# XGBoost — memory-efficient settings for 512MB Render free tier
 XGB_PARAMS: dict = {
-    "n_estimators":    100,   # reduced from 400 — fits in 512MB RAM
-    "max_depth":       4,     # reduced from 6
-    "learning_rate":   0.1,
-    "subsample":       0.8,
-    "colsample_bytree":0.8,
-    "reg_alpha":       0.1,
-    "reg_lambda":      1.0,
+    "n_estimators":    150,
+    "max_depth":       4,
+    "learning_rate":   0.08,
+    "subsample":       0.75,
+    "colsample_bytree":0.75,
+    "min_child_weight":3,
+    "reg_alpha":       0.2,
+    "reg_lambda":      1.5,
     "random_state":    42,
-    "n_jobs":          1,     # single thread — prevents OOM on free tier
-    "tree_method":     "hist",# memory-efficient histogram method
+    "n_jobs":          1,       # single thread — prevents OOM on free tier
+    "tree_method":     "hist",  # memory-efficient
+    "early_stopping_rounds": 20,
+}
+
+# LightGBM params (used if lgbm installed — much faster, less memory)
+LGBM_PARAMS: dict = {
+    "n_estimators":    200,
+    "max_depth":       5,
+    "learning_rate":   0.08,
+    "subsample":       0.75,
+    "colsample_bytree":0.75,
+    "min_child_samples":10,
+    "reg_alpha":       0.2,
+    "reg_lambda":      1.5,
+    "random_state":    42,
+    "n_jobs":          1,
+    "verbose":        -1,
 }
 
 # ── News Sentiment ─────────────────────────────────────────────────────────────
