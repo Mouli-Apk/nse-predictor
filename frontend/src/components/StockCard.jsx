@@ -185,10 +185,38 @@ function HorizonPanel({ pred, currentPrice, hKey, ticker, sector, onLocked }) {
       {/* Confidence */}
       <ConfBar value={pred.confidence}/>
 
-      {/* MAPE */}
-      <div style={{ marginTop:7, display:'flex', justifyContent:'space-between',
+      {/* Direction probability bar */}
+      {pred.dir_proba && (
+        <div style={{ marginTop:9, marginBottom:2 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', fontSize:9,
+            color:'var(--slate-light)', fontFamily:'var(--font-mono)', fontWeight:700,
+            letterSpacing:1, marginBottom:4 }}>
+            <span>DIRECTION PROBABILITY</span>
+            <span style={{ color: pred.dir_acc >= 60 ? 'var(--buy)' : 'var(--hold)' }}>
+              {pred.dir_acc}% hist. accuracy
+            </span>
+          </div>
+          <div style={{ display:'flex', height:16, borderRadius:4, overflow:'hidden', gap:1 }}>
+            {[
+              ['DOWN', pred.dir_proba?.DOWN || 0, 'var(--sell)'],
+              ['FLAT', pred.dir_proba?.FLAT || 0, 'var(--hold)'],
+              ['UP',   pred.dir_proba?.UP   || 0, 'var(--buy)' ],
+            ].map(([label, pct, color]) => (
+              <div key={label} style={{ width:`${pct}%`, background:color, opacity:.85,
+                display:'flex', alignItems:'center', justifyContent:'center',
+                fontSize:8, fontWeight:700, color:'#fff', overflow:'hidden',
+                transition:'width .5s ease', minWidth: pct > 10 ? undefined : 0 }}>
+                {pct > 12 ? `${label} ${pct.toFixed(0)}%` : pct > 5 ? `${pct.toFixed(0)}%` : ''}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* MAPE & Sentiment */}
+      <div style={{ marginTop:6, display:'flex', justifyContent:'space-between',
         fontSize:9, color:'var(--slate-light)', fontFamily:'var(--font-mono)' }}>
-        <span>VAL MAPE: <span style={{
+        <span>MAPE: <span style={{
           color: pred.val_mape <= 3 ? 'var(--buy)' : pred.val_mape <= 5 ? 'var(--hold)' : 'var(--sell)',
           fontWeight:700 }}>{pred.val_mape}%</span></span>
         {pred.sentiment !== undefined && pred.sentiment !== 0 && (
@@ -406,7 +434,7 @@ export default function StockCard({ ticker, initialData }) {
               <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
                 <thead>
                   <tr style={{ background:'var(--slate-faint)' }}>
-                    {['Horizon','Pred ₹','Chg %','Signal','Conf','MAPE'].map(h => (
+                    {['Horizon','Pred ₹','Chg %','Signal','Dir%','MAPE'].map(h => (
                       <th key={h} style={{ padding:'5px 7px', textAlign:'left',
                         fontSize:9, color:'var(--slate)', fontWeight:700,
                         textTransform:'uppercase', letterSpacing:.5 }}>{h}</th>
@@ -442,8 +470,8 @@ export default function StockCard({ ticker, initialData }) {
                           </span>
                         </td>
                         <td style={{ padding:'6px 7px', fontFamily:'var(--font-mono)',
-                          color: p.confidence >= 70 ? 'var(--buy)' : 'var(--slate)' }}>
-                          {p.confidence}%
+                          color: (p.dir_acc || p.confidence) >= 60 ? 'var(--buy)' : 'var(--slate)' }}>
+                          {p.dir_acc != null ? `${p.dir_acc}%` : `${p.confidence}%`}
                         </td>
                         <td style={{ padding:'6px 7px', fontFamily:'var(--font-mono)',
                           color: p.val_mape <= 3 ? 'var(--buy)' : 'var(--sell)' }}>
