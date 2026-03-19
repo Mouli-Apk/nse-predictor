@@ -85,7 +85,7 @@ export default function Header({ onRetrain, retraining }) {
               NSE Intraday Predictor
             </div>
             <div style={{ fontSize: 10, opacity: .65, letterSpacing: 1, marginTop: 2 }}>
-              XGBoost · T+15 MIN · 25 STOCKS
+              XGBoost · T+15 | T+1H | T+3H · 25 STOCKS
             </div>
           </div>
         </div>
