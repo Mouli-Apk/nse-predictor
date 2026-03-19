@@ -184,6 +184,35 @@ def scorecard() -> dict:
     return _build_scorecard()
 
 
+@app.get("/after-market")
+def after_market(top_n: int = 7) -> dict:
+    """
+    Post-close analysis — top stocks for tomorrow's pre-open session.
+    Best called after 3:30 PM IST or before 9:15 AM IST.
+    """
+    return ml_logic.after_market_analysis(top_n=top_n)
+
+
+@app.get("/market-status")
+def market_status() -> dict:
+    """Returns whether NSE market is currently open/closed in IST."""
+    from datetime import timezone
+    now_utc = datetime.utcnow()
+    ist_offset = timedelta(hours=5, minutes=30)
+    now_ist = now_utc + ist_offset
+    h, m = now_ist.hour, now_ist.minute
+    is_open = ((h > 9) or (h == 9 and m >= 15)) and ((h < 15) or (h == 15 and m <= 30))
+    return {
+        "is_open":    is_open,
+        "ist_time":   now_ist.strftime("%H:%M IST"),
+        "ist_date":   now_ist.strftime("%d %b %Y"),
+        "opens_at":   "09:15 IST",
+        "closes_at":  "15:30 IST",
+        "after_close": not is_open and h >= 15,
+        "pre_open":    not is_open and h < 9,
+    }
+
+
 def _log_prediction(result: dict) -> None:
     ticker = result.get("ticker", "")
     if ticker and result.get("status") == "ok":
