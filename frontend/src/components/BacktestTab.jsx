@@ -100,9 +100,11 @@ export default function BacktestTab() {
     }
   }
 
+  // Support both old flat mape and new overall_mape from multi-horizon response
+  const getMape = r => r.overall_mape ?? r.mape ?? 999
   const chartData = results?.results
     ?.filter(r => r.status === 'ok')
-    .map(r => ({ ticker: r.ticker.replace('.NS', ''), mape: r.mape }))
+    .map(r => ({ ticker: r.ticker.replace('.NS', ''), mape: getMape(r) }))
     .sort((a, b) => a.mape - b.mape) || []
 
   return (
@@ -240,8 +242,17 @@ export default function BacktestTab() {
                       {r.date || '—'}
                     </td>
                     <td style={{ padding: '9px 14px', fontFamily: 'var(--font-mono)',
-                      color: r.mape <= 3 ? 'var(--buy)' : 'var(--sell)', fontWeight: 600 }}>
-                      {r.mape != null ? `${r.mape.toFixed(2)}%` : r.message || '—'}
+                      color: getMape(r) <= 3 ? 'var(--buy)' : 'var(--sell)', fontWeight: 600 }}>
+                      {r.status === 'ok'
+                        ? <>
+                            <span>{getMape(r).toFixed(2)}%</span>
+                            {r.overall_dir_acc != null && (
+                              <span style={{ fontSize:10, color:'var(--slate-light)', marginLeft:6 }}>
+                                dir:{r.overall_dir_acc.toFixed(0)}%
+                              </span>
+                            )}
+                          </>
+                        : r.message || '—'}
                     </td>
                     <td style={{ padding: '9px 14px' }}>
                       {r.status === 'ok' ? <PassBadge passed={r.passed} /> : (
@@ -282,7 +293,7 @@ export default function BacktestTab() {
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
                   <thead>
                     <tr style={{ background: 'var(--slate-faint)' }}>
-                      {['Time', 'Actual ₹', 'Predicted ₹', 'True Future ₹', 'Error %'].map(h => (
+                      {['Time', 'Actual ₹', 'Predicted ₹', 'True ₹', 'Price Err%', 'Dir'].map(h => (
                         <th key={h} style={{
                           padding: '8px 12px', textAlign: 'left', fontWeight: 600,
                           fontSize: 10, textTransform: 'uppercase', color: 'var(--slate)',
@@ -306,9 +317,15 @@ export default function BacktestTab() {
                         <td style={{
                           padding: '7px 12px', fontFamily: 'var(--font-mono)',
                           fontWeight: 700,
-                          color: s.error_pct <= 3 ? 'var(--buy)' : 'var(--sell)',
+                          color: (s.price_error_pct ?? s.error_pct ?? 0) <= 3 ? 'var(--buy)' : 'var(--sell)',
                         }}>
-                          {s.error_pct.toFixed(2)}%
+                          {((s.price_error_pct ?? s.error_pct) || 0).toFixed(2)}%
+                        </td>
+                        <td style={{ padding:'7px 12px', fontSize:11, fontWeight:700,
+                          color: s.dir_correct ? 'var(--buy)' : s.dir_correct === false ? 'var(--sell)' : 'var(--slate-light)',
+                        }}>
+                          {s.dir_correct != null ? (s.dir_correct ? '✓' : '✗') : '—'}
+                          {s.pred_direction ? ` ${s.pred_direction}` : ''}
                         </td>
                       </tr>
                     ))}
