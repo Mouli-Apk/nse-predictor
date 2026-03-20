@@ -196,17 +196,16 @@ function HorizonPanel({ pred, currentPrice, hKey, ticker, sector, onLocked }) {
               {pred.dir_acc}% hist. accuracy
             </span>
           </div>
-          <div style={{ display:'flex', height:16, borderRadius:4, overflow:'hidden', gap:1 }}>
+          <div style={{ display:'flex', height:18, borderRadius:4, overflow:'hidden', gap:2 }}>
             {[
-              ['DOWN', pred.dir_proba?.DOWN || 0, 'var(--sell)'],
-              ['FLAT', pred.dir_proba?.FLAT || 0, 'var(--hold)'],
-              ['UP',   pred.dir_proba?.UP   || 0, 'var(--buy)' ],
+              ['▼ DOWN', pred.dir_proba?.DOWN || 0, 'var(--sell)'],
+              ['▲ UP',   pred.dir_proba?.UP   || 0, 'var(--buy)' ],
             ].map(([label, pct, color]) => (
-              <div key={label} style={{ width:`${pct}%`, background:color, opacity:.85,
+              <div key={label} style={{ width:`${pct}%`, background:color,
                 display:'flex', alignItems:'center', justifyContent:'center',
-                fontSize:8, fontWeight:700, color:'#fff', overflow:'hidden',
-                transition:'width .5s ease', minWidth: pct > 10 ? undefined : 0 }}>
-                {pct > 12 ? `${label} ${pct.toFixed(0)}%` : pct > 5 ? `${pct.toFixed(0)}%` : ''}
+                fontSize:9, fontWeight:800, color:'#fff', overflow:'hidden',
+                transition:'width .6s ease', letterSpacing:.5 }}>
+                {pct > 15 ? `${label} ${pct.toFixed(0)}%` : pct > 8 ? `${pct.toFixed(0)}%` : ''}
               </div>
             ))}
           </div>
