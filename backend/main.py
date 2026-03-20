@@ -193,6 +193,31 @@ def after_market(top_n: int = 7) -> dict:
     return ml_logic.after_market_analysis(top_n=top_n)
 
 
+@app.get("/cache-status")
+def cache_status() -> dict:
+    """How many predictions are cached and their ages."""
+    now = datetime.utcnow()
+    entries = []
+    for ticker, c in ml_logic._PREDICT_CACHE.items():
+        age = (now - c["cached_at"]).total_seconds()
+        entries.append({"ticker": ticker, "age_seconds": round(age, 1)})
+    return {
+        "cached_predictions": len(entries),
+        "ttl_seconds":        ml_logic._CACHE_TTL_SECONDS,
+        "entries":            entries,
+    }
+
+
+@app.delete("/cache")
+def clear_cache() -> dict:
+    """Clear all prediction caches — forces fresh OHLCV fetch on next predict."""
+    count = len(ml_logic._PREDICT_CACHE)
+    ml_logic._PREDICT_CACHE.clear()
+    for ticker in ml_logic._MODEL_REGISTRY:
+        ml_logic._MODEL_REGISTRY[ticker].pop("last_fetched", None)
+    return {"cleared": count, "message": "Cache cleared — next predict-all will re-fetch live data"}
+
+
 @app.get("/market-status")
 def market_status() -> dict:
     """Returns whether NSE market is currently open/closed in IST."""
@@ -256,6 +281,9 @@ def _build_scorecard() -> dict[str, Any]:
 def _retrain_background(tickers: list[str]) -> None:
     logger.info("Background retrain started for %d tickers", len(tickers))
     try:
+        # Clear prediction cache so fresh data is fetched after retrain
+        for t in tickers:
+            ml_logic._PREDICT_CACHE.pop(t, None)
         results = ml_logic.train_all(tickers)
         ok = sum(1 for r in results if r.get("status") == "ok")
         logger.info("Background retrain complete: %d/%d succeeded", ok, len(tickers))
