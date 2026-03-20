@@ -793,17 +793,21 @@ def predict(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
             dir_pred  = int(np.argmax(proba))             # 0=DOWN,1=FLAT,2=UP
             dir_label = {0: "DOWN", 1: "FLAT", 2: "UP"}[dir_pred]
 
-            # Normalised confidence: maps random baseline (33%) → 0%, certain (100%) → 100%
-            # Raw proba of 33% = no better than guessing = 0% confidence shown
-            # Raw proba of 67% = moderately confident = 50% confidence shown
-            # Raw proba of 90% = highly confident = 85% confidence shown
-            RANDOM_BASELINE = 1.0 / 3.0
-            conf_norm  = (float(proba[dir_pred]) - RANDOM_BASELINE) / (1.0 - RANDOM_BASELINE)
-            conf_norm  = max(0.0, conf_norm)
-            # Boost if non-flat signals are strong (model is decisively directional)
-            dir_strength = float(proba[0] + proba[2])
-            conf_boost   = 1.0 + (dir_strength - 0.5) * 0.15 if dir_strength > 0.5 else 1.0
-            confidence   = round(min(99.0, conf_norm * 100 * conf_boost), 1)
+            # Confidence formula — 3-class classifiers need sqrt rescaling.
+            # With FLAT dominating, UP/DOWN probas are typically 0.36-0.55.
+            # Linear normalisation maps 0.45 → only 18% (misleadingly low).
+            # Sqrt rescaling: 0.40→32%, 0.50→50%, 0.60→63%, 0.75→78%
+            RANDOM_BASE  = 1.0 / 3.0
+            raw          = float(proba[dir_pred])
+            norm         = max(0.0, (raw - RANDOM_BASE) / (1.0 - RANDOM_BASE))
+            conf_from_prob = round(min(99.0, np.sqrt(norm) * 100), 1)
+
+            # Blend with historical directional accuracy for stability
+            # 70% weight on calibrated proba, 30% weight on historical d_acc
+            d_acc       = dir_accs.get(h_key, 50.0)
+            d_acc_norm  = max(0.0, (d_acc - 50.0) / 50.0) * 100   # 50%→0, 100%→100
+            confidence  = round(0.70 * conf_from_prob + 0.30 * d_acc_norm, 1)
+            confidence  = max(5.0, min(99.0, confidence))   # floor at 5%
 
             # Magnitude from regressor
             pred_log_ret = float(rgr.predict(X_pruned)[0])
@@ -1092,10 +1096,14 @@ def _score_stock(ticker: str) -> dict[str, Any] | None:
         dir_pred   = int(np.argmax(proba))
         pred_ret   = float(rgr.predict(X_pruned)[0])
 
-        # Normalised confidence
-        RANDOM_BASE = 1.0 / 3.0
-        conf_norm   = max(0.0, (float(proba[dir_pred]) - RANDOM_BASE) / (1.0 - RANDOM_BASE))
-        confidence  = round(min(99.0, conf_norm * 100), 1)
+        # Same sqrt rescaling as live predict for consistency
+        RANDOM_BASE    = 1.0 / 3.0
+        raw_p          = float(proba[dir_pred])
+        norm_p         = max(0.0, (raw_p - RANDOM_BASE) / (1.0 - RANDOM_BASE))
+        conf_from_prob = min(99.0, np.sqrt(norm_p) * 100)
+        d_acc          = dir_accs.get(best_horizon, 50.0)
+        d_acc_norm     = max(0.0, (d_acc - 50.0) / 50.0) * 100
+        confidence     = round(max(5.0, 0.70 * conf_from_prob + 0.30 * d_acc_norm), 1)
 
         # Predicted opening price (using log return from close)
         if dir_pred == 2:
