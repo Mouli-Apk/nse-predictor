@@ -7,6 +7,7 @@ uvicorn[standard]==0.29.0
 pydantic==2.7.1
 
 # ── ML Core (pre-built wheels for Python 3.11) ────────────────────────────────
+lightgbm==4.3.0
 xgboost==2.0.3
 scikit-learn==1.4.2
 numpy==1.26.4
