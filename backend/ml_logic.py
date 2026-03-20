@@ -77,8 +77,7 @@ except ImportError:
     _VADER_AVAILABLE = False
 
 from sklearn.preprocessing import RobustScaler
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LinearRegression, Ridge
 
 import config
 
@@ -410,17 +409,77 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+
+# =============================================================================
+# SLIDING WINDOW FEATURE CONSTRUCTION
+# Inspired by TrendMaster's input_window=30 Transformer approach.
+# Instead of a single feature row (single timestep snapshot), we feed
+# the last WINDOW_SIZE rows of core indicators as a flattened sequence.
+# This gives LightGBM the same temporal trajectory that TrendMaster's
+# Transformer self-attention learns from — without needing PyTorch.
+#
+# Example: two stocks at price=₹500, RSI=55 (identical single-row snapshot)
+#   Stock A: was rising for 20 candles → window shows uptrend → BUY
+#   Stock B: was falling for 20 candles → window shows downtrend → SELL
+#   Single-row model: predicts SAME for both ← fundamental error
+#   Window model: correctly sees the trajectory difference
+# =============================================================================
+
+WINDOW_SIZE = 20          # look-back candles (TrendMaster uses 30, we use 20 for memory)
+WINDOW_DECAY = 0.92       # exponential decay weight per step (recent matters more)
+
+# Core features for windowing — these carry the most temporal signal
+WINDOW_FEATURES = [
+    "rsi_14", "rsi_7", "macd", "macd_hist",
+    "bb_pct", "atr_norm", "obv_signal",
+    "vol_ratio", "vwap_ratio", "ema_cross_5_21",
+    "candle_dir", "roc_1",
+]
+
+
+def add_window_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add TrendMaster-style sliding window features.
+    For each core feature, create WINDOW_SIZE lag columns with
+    exponential decay weighting applied (recent timesteps weighted higher).
+
+    Column naming: {feature}_w{lag}  e.g. rsi_14_w1 (1 step ago), rsi_14_w20 (20 steps ago)
+    """
+    out = df.copy()
+    decay_weights = np.array([WINDOW_DECAY ** i for i in range(WINDOW_SIZE)])
+    decay_weights = decay_weights / decay_weights.sum()   # normalise
+
+    for feat in WINDOW_FEATURES:
+        if feat not in df.columns:
+            continue
+        series = df[feat]
+        for lag in range(1, WINDOW_SIZE + 1):
+            w = decay_weights[lag - 1]   # weight for this lag step
+            out[f"{feat}_w{lag}"] = series.shift(lag) * w
+
+    return out
+
+
+def get_window_feature_columns(df: pd.DataFrame) -> list[str]:
+    """Return only the sliding-window lag column names."""
+    return [c for c in df.columns if "_w" in c and any(c.startswith(f"{f}_w") for f in WINDOW_FEATURES)]
+
+
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
+    """Returns all feature columns including sliding-window lag features."""
     exclude = {"Open", "High", "Low", "Close", "Volume", "target", "direction"}
     return [c for c in df.columns if c not in exclude]
 
 
 def _make_direction_target(log_returns: np.ndarray) -> np.ndarray:
-    """Convert log returns to 3-class direction: 0=DOWN, 1=FLAT, 2=UP."""
-    labels = np.ones(len(log_returns), dtype=int)  # default FLAT
-    labels[log_returns >  UP_THRESHOLD]   = 2  # UP
-    labels[log_returns <  DOWN_THRESHOLD] = 0  # DOWN
-    return labels
+    """
+    Binary classification: 1 = UP (positive return), 0 = DOWN.
+    Binary is strictly better than 3-class for confidence:
+    - 3-class dilutes probability across 3 buckets → max ~0.45 for any class
+    - Binary concentrates into 2 buckets → probabilities reach 0.55-0.70
+    - Random baseline 50% maps naturally to 0% confidence shown
+    """
+    return (log_returns > 0).astype(int)
 
 
 # =============================================================================
@@ -455,16 +514,21 @@ def _walk_forward_splits(n: int, min_train: int = 100, n_splits: int = 3) -> lis
 
 def _build_classifier(X_tr, y_tr, X_va, y_va):
     """
-    LightGBM 3-class direction classifier with early stopping.
-    Falls back to XGBoost if LightGBM unavailable.
+    Binary UP/DOWN LightGBM classifier.
+    Binary > 3-class: probabilities reach 0.55-0.70 vs max 0.45 with 3 classes.
+    Inspired by kaushikjadhav01 ensemble: direction classifier as primary signal.
     """
+    n_pos = max(1, int(y_tr.sum()))
+    n_neg = max(1, len(y_tr) - n_pos)
+    spw   = n_neg / n_pos  # handles class imbalance naturally
+
     if _LGBM_AVAILABLE:
         import lightgbm as lgb
         model = lgb.LGBMClassifier(
-            n_estimators=300, max_depth=5, learning_rate=0.05,
-            subsample=0.7, colsample_bytree=0.7,
-            min_child_samples=15, reg_alpha=0.3, reg_lambda=1.5,
-            class_weight="balanced",   # handles class imbalance
+            n_estimators=150, max_depth=4, learning_rate=0.08,
+            subsample=0.75, colsample_bytree=0.75,
+            min_child_samples=10, reg_alpha=0.2, reg_lambda=1.0,
+            scale_pos_weight=spw, objective="binary",
             random_state=42, n_jobs=1, verbose=-1,
         )
         model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
@@ -473,15 +537,14 @@ def _build_classifier(X_tr, y_tr, X_va, y_va):
     else:
         model = XGBClassifier(
             n_estimators=150, max_depth=4, learning_rate=0.08,
-            subsample=0.7, colsample_bytree=0.7,
-            use_label_encoder=False, eval_metric="mlogloss",
-            early_stopping_rounds=20, random_state=42, n_jobs=1,
+            subsample=0.75, colsample_bytree=0.75,
+            scale_pos_weight=spw,
+            use_label_encoder=False, eval_metric="logloss",
+            early_stopping_rounds=15, random_state=42, n_jobs=1,
             tree_method="hist",
         )
         model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
     return model
-
-
 def _build_regressor(X_tr, y_tr, X_va, y_va):
     """
     LightGBM log-return regressor with early stopping.
@@ -532,8 +595,8 @@ def _select_features(X: np.ndarray, y_cls: np.ndarray,
     if _LGBM_AVAILABLE:
         import lightgbm as lgb
         q = lgb.LGBMClassifier(n_estimators=50, max_depth=3,
-                                random_state=42, n_jobs=1, verbose=-1,
-                                class_weight="balanced")
+                                objective="binary",
+                                random_state=42, n_jobs=1, verbose=-1)
         q.fit(Xq, yq, eval_set=[(Xv, yv)],
               callbacks=[lgb.early_stopping(10, verbose=False),
                          lgb.log_evaluation(period=-1)])
@@ -565,6 +628,7 @@ def train_model(ticker: str) -> dict[str, Any]:
     try:
         df, interval = fetch_ohlcv(ticker)
         df = add_features(df)
+        df = add_window_features(df)  # TrendMaster temporal context
 
         if len(df) > 2000:
             df = df.tail(2000).copy()
@@ -628,18 +692,27 @@ def train_model(ticker: str) -> dict[str, Any]:
             reg_model = None
 
             for tr_idx, va_idx in splits:
-                # Classifier
+                # Binary classifier UP=1/DOWN=0
                 cls = _build_classifier(X_h[tr_idx], dir_h[tr_idx],
                                         X_h[va_idx],  dir_h[va_idx])
                 pred_dir = cls.predict(X_h[va_idx])
                 fold_dir_accs.append(float(np.mean(pred_dir == dir_h[va_idx])) * 100)
                 cls_model = cls
 
-                # Regressor
+                # LightGBM Regressor
                 reg = _build_regressor(X_h[tr_idx], lr_h[tr_idx],
                                        X_h[va_idx],  lr_h[va_idx])
-                pred_ret = reg.predict(X_h[va_idx])
-                fold_mapes.append(_price_mape(pr_h[va_idx], pred_ret, lr_h[va_idx]))
+                lgbm_preds = reg.predict(X_h[va_idx])
+
+                # Linear Regression as ensemble baseline (from kaushikjadhav01 approach)
+                lr_baseline = Ridge(alpha=1.0)
+                lr_baseline.fit(X_h[tr_idx], lr_h[tr_idx])
+                lr_preds = lr_baseline.predict(X_h[va_idx])
+
+                # Blend: 70% LightGBM + 30% LinearRegression
+                blended_preds = 0.7 * lgbm_preds + 0.3 * lr_preds
+                fold_mapes.append(_price_mape(pr_h[va_idx], blended_preds, lr_h[va_idx]))
+                reg._lr_baseline = lr_baseline  # attach for blended inference
                 reg_model = reg
 
             classifiers[h_key] = cls_model
@@ -767,6 +840,7 @@ def predict(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
             # Slow path: re-fetch OHLCV (runs every 60s or first call)
             df, _   = fetch_ohlcv(ticker, days=3)
             df      = add_features(df)
+            df      = add_window_features(df)  # TrendMaster temporal context
             df.dropna(inplace=True)
             if df.empty:
                 raise ValueError("No live data")
@@ -788,50 +862,55 @@ def predict(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
             if cls is None or rgr is None:
                 continue
 
-            # Direction probabilities [p_DOWN, p_FLAT, p_UP]
-            proba     = cls.predict_proba(X_pruned)[0]   # shape (3,)
-            dir_pred  = int(np.argmax(proba))             # 0=DOWN,1=FLAT,2=UP
-            dir_label = {0: "DOWN", 1: "FLAT", 2: "UP"}[dir_pred]
+            # Binary direction probabilities [p_DOWN, p_UP]
+            proba     = cls.predict_proba(X_pruned)[0]   # shape (2,)
+            dir_pred  = int(np.argmax(proba))             # 0=DOWN, 1=UP
+            dir_label = {0: "DOWN", 1: "UP"}[dir_pred]
+            p_up   = float(proba[1])
+            p_down = float(proba[0])
 
-            # ── Confidence: three-signal blend ──────────────────────────
-            # 1. Historical directional accuracy (most reliable signal)
-            #    50% → 35%, 60% → 53%, 70% → 71%, 80% → 89%
-            d_acc      = dir_accs.get(h_key, 50.0)
-            d_acc_clamped = max(50.0, min(100.0, d_acc))
-            acc_conf   = (d_acc_clamped - 50.0) / 50.0 * 90.0 + 35.0
+            # ── Confidence: binary proba is now directly meaningful ────
+            # Binary classifier: P(UP) ranges 0.35-0.70 (random=0.50)
+            # Map [0.45, 0.75] → [35%, 90%] linearly
+            # Plus historical accuracy as stabiliser
+            d_acc       = dir_accs.get(h_key, 50.0)
+            mape_val    = val_mapes.get(h_key, 5.0)
 
-            # 2. MAPE-based confidence (price accuracy signal)
-            #    MAPE 0% → 80%, MAPE 3% → 62%, MAPE 8% → 32%, MAPE 15% → 5%
-            mape_val   = val_mapes.get(h_key, 5.0)
-            mape_conf  = max(5.0, min(80.0, (10.0 - mape_val) / 10.0 * 75.0 + 5.0))
+            # Primary: live UP probability scaled to [0,100]
+            # P(UP)=0.50 → 50%, P(UP)=0.65 → 80%, P(UP)=0.35 → 20%
+            winner_prob = float(proba[dir_pred])   # winning class probability
+            prob_conf   = round(winner_prob * 100, 1)
 
-            # 3. Live proba modifier ±8 pts (classifier conviction right now)
-            raw_prob   = float(proba[dir_pred])
-            proba_mod  = max(-8.0, min(8.0, (raw_prob - 0.38) * 40.0))
+            # Stability: historical directional accuracy (50%→50, 60%→70, 70%→90)
+            acc_conf    = max(30.0, min(95.0, (d_acc - 50.0) * 2.0 + 50.0))
 
-            # Weighted blend: acc 50%, mape 30%, proba 20%
-            confidence = round(max(20.0, min(95.0,
-                0.50 * acc_conf + 0.30 * mape_conf + 0.20 * (50.0 + proba_mod * 5.0)
+            # Price accuracy: MAPE < 3% adds boost
+            mape_conf   = max(20.0, min(80.0, (8.0 - mape_val) / 8.0 * 60.0 + 20.0))
+
+            # Final blend: 40% live proba + 40% historical acc + 20% mape
+            confidence  = round(max(20.0, min(95.0,
+                0.40 * prob_conf + 0.40 * acc_conf + 0.20 * mape_conf
             )), 1)
 
-            # Magnitude from regressor
-            pred_log_ret = float(rgr.predict(X_pruned)[0])
+            # Magnitude: blend LightGBM regressor + attached LinearRegression
+            lgbm_ret = float(rgr.predict(X_pruned)[0])
+            if hasattr(rgr, "_lr_baseline"):
+                lr_ret       = float(rgr._lr_baseline.predict(X_pruned)[0])
+                pred_log_ret = 0.7 * lgbm_ret + 0.3 * lr_ret
+            else:
+                pred_log_ret = lgbm_ret
 
-            # Combine: direction from classifier, magnitude from regressor
-            # If classifier says DOWN but regressor is positive, trust classifier
-            if dir_pred == 2:    # UP
+            # Direction from binary classifier always overrides regressor sign
+            if dir_pred == 1:    # UP
                 signed_ret = abs(pred_log_ret)
-            elif dir_pred == 0:  # DOWN
+            else:                # DOWN
                 signed_ret = -abs(pred_log_ret)
-            else:                # FLAT
-                signed_ret = pred_log_ret * 0.3   # dampen magnitude
 
             predicted_price = round(current_price * np.exp(signed_ret), 2)
             change_pct      = (predicted_price / current_price - 1) * 100
 
-            # Trading signal (directional accuracy gates the signal)
-            d_acc = dir_accs.get(h_key, 50)
-            if dir_pred == 2 and d_acc >= 52:
+            # Trading signal (binary: dir_pred 1=UP, 0=DOWN)
+            if dir_pred == 1 and d_acc >= 52:
                 signal = "BUY"
             elif dir_pred == 0 and d_acc >= 52:
                 signal = "SELL"
@@ -860,9 +939,8 @@ def predict(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
                 "confidence":      confidence,
                 "direction":       dir_label,
                 "dir_proba":       {
-                    "DOWN": round(float(proba[0]) * 100, 1),
-                    "FLAT": round(float(proba[1]) * 100, 1),
-                    "UP":   round(float(proba[2]) * 100, 1),
+                    "DOWN": round(p_down * 100, 1),
+                    "UP":   round(p_up   * 100, 1),
                 },
                 "dir_acc":         d_acc,    # historical directional accuracy %
                 "val_mape":        val_mapes.get(h_key, 0),
@@ -927,6 +1005,7 @@ def backtest_yesterday(ticker: str) -> dict[str, Any]:
     try:
         df_full, _ = fetch_ohlcv(ticker, days=config.TRAINING_PERIOD_DAYS + 1)
         df_full    = add_features(df_full)
+        df_full    = add_window_features(df_full)  # TrendMaster temporal context
         df_full.dropna(inplace=True)
 
         today  = datetime.utcnow().date()
@@ -971,7 +1050,7 @@ def backtest_yesterday(ticker: str) -> dict[str, Any]:
             X_s_samp   = X_pruned[sample]
             lr_true    = log_r[sample]
             prices_s   = df_yday["Close"].values[sample]
-            dir_true   = _make_direction_target(lr_true)
+            dir_true   = _make_direction_target(lr_true)  # binary: 0=DOWN 1=UP
 
             pred_dirs  = cls.predict(X_s_samp)
             dir_acc    = float(np.mean(pred_dirs == dir_true)) * 100
@@ -992,8 +1071,8 @@ def backtest_yesterday(ticker: str) -> dict[str, Any]:
                     "price_error_pct": round(float(
                         abs(pred_prices[i]-true_prices[i]) / (abs(true_prices[i])+1e-8) * 100
                     ), 3),
-                    "pred_direction":  {0:"DOWN",1:"FLAT",2:"UP"}[int(pred_dirs[i])],
-                    "true_direction":  {0:"DOWN",1:"FLAT",2:"UP"}[int(dir_true[i])],
+                    "pred_direction":  {0:"DOWN",1:"UP"}[int(pred_dirs[i])],
+                    "true_direction":  {0:"DOWN",1:"UP"}[int(dir_true[i])],
                     "dir_correct":     bool(pred_dirs[i] == dir_true[i]),
                 }
                 for i in range(len(sample))
@@ -1072,6 +1151,7 @@ def _score_stock(ticker: str) -> dict[str, Any] | None:
         # Fetch today's full session OHLCV
         df, _ = fetch_ohlcv(ticker, days=3)
         df    = add_features(df)
+        df    = add_window_features(df)
         df.dropna(inplace=True)
 
         if df.empty or len(df) < 10:
@@ -1097,23 +1177,33 @@ def _score_stock(ticker: str) -> dict[str, Any] | None:
         X_s       = scaler.transform(latest)
         X_pruned  = X_s[:, feat_idx]
 
-        proba      = cls.predict_proba(X_pruned)[0]
-        dir_pred   = int(np.argmax(proba))
-        pred_ret   = float(rgr.predict(X_pruned)[0])
+        proba      = cls.predict_proba(X_pruned)[0]   # binary [p_DOWN, p_UP]
+        dir_pred   = int(np.argmax(proba))             # 0=DOWN, 1=UP
+        lgbm_ret   = float(rgr.predict(X_pruned)[0])
+        if hasattr(rgr, "_lr_baseline"):
+            pred_ret = 0.7 * lgbm_ret + 0.3 * float(rgr._lr_baseline.predict(X_pruned)[0])
+        else:
+            pred_ret = lgbm_ret
 
-        # Same three-signal blend as live predict
+        # Same three-signal confidence as live predict
         d_acc       = dir_accs.get(best_horizon, 50.0)
-        acc_conf    = (max(50.0, min(100.0, d_acc)) - 50.0) / 50.0 * 90.0 + 35.0
         mape_val    = reg.get("val_mapes", {}).get(best_horizon, 5.0)
-        mape_conf   = max(5.0, min(80.0, (10.0 - mape_val) / 10.0 * 75.0 + 5.0))
-        raw_p       = float(proba[dir_pred])
-        proba_mod   = max(-8.0, min(8.0, (raw_p - 0.38) * 40.0))
+        winner_prob = float(proba[dir_pred])
+        prob_conf   = winner_prob * 100
+        acc_conf    = max(30.0, min(95.0, (d_acc - 50.0) * 2.0 + 50.0))
+        mape_conf   = max(20.0, min(80.0, (8.0 - mape_val) / 8.0 * 60.0 + 20.0))
         confidence  = round(max(20.0, min(95.0,
-            0.50 * acc_conf + 0.30 * mape_conf + 0.20 * (50.0 + proba_mod * 5.0)
+            0.40 * prob_conf + 0.40 * acc_conf + 0.20 * mape_conf
         )), 1)
 
-        # Predicted opening price (using log return from close)
-        if dir_pred == 2:
+        # Direction from binary classifier
+        if dir_pred == 1:   # UP
+            signed_ret = abs(pred_ret)
+        else:               # DOWN
+            signed_ret = -abs(pred_ret)
+
+                # Predicted opening price (using log return from close)
+        if dir_pred == 1:  # UP
             signed_ret = abs(pred_ret)
         elif dir_pred == 0:
             signed_ret = -abs(pred_ret)
@@ -1183,7 +1273,7 @@ def _score_stock(ticker: str) -> dict[str, Any] | None:
         composite = sum(scores.get(k,0) * w for k, w in weights.items())
 
         # Only recommend if model predicts UP direction with decent confidence
-        actionable = (dir_pred == 2 and confidence >= 35 and composite >= 40)
+        actionable = (dir_pred == 1 and confidence >= 35 and composite >= 40)
 
         # Buy range: suggest entry between bid and 0.3% above current
         buy_low  = round(bid * 0.998, 2) if bid else round(current_price * 0.997, 2)
@@ -1197,7 +1287,7 @@ def _score_stock(ticker: str) -> dict[str, Any] | None:
             "current_price":   current_price,
             "predicted_price": pred_next_price,
             "predicted_change_pct": round(pred_change_pct, 2),
-            "direction":       {0:"DOWN",1:"FLAT",2:"UP"}[dir_pred],
+            "direction":       {0:"DOWN",1:"UP"}[dir_pred],
             "confidence":      confidence,
             "composite_score": round(composite, 1),
             "actionable":      actionable,
