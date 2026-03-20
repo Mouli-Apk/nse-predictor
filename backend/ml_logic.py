@@ -621,7 +621,7 @@ def train_model(ticker: str) -> dict[str, Any]:
                 logger.warning("  %s %s: too few rows (%d)", ticker, h_key, len(X_h))
                 continue
 
-            splits = _walk_forward_splits(len(X_h), min_train=60, n_splits=2)
+            splits = _walk_forward_splits(len(X_h), min_train=30, n_splits=2)
 
             fold_dir_accs, fold_mapes = [], []
             cls_model = None
@@ -793,21 +793,26 @@ def predict(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
             dir_pred  = int(np.argmax(proba))             # 0=DOWN,1=FLAT,2=UP
             dir_label = {0: "DOWN", 1: "FLAT", 2: "UP"}[dir_pred]
 
-            # Confidence formula — 3-class classifiers need sqrt rescaling.
-            # With FLAT dominating, UP/DOWN probas are typically 0.36-0.55.
-            # Linear normalisation maps 0.45 → only 18% (misleadingly low).
-            # Sqrt rescaling: 0.40→32%, 0.50→50%, 0.60→63%, 0.75→78%
-            RANDOM_BASE  = 1.0 / 3.0
-            raw          = float(proba[dir_pred])
-            norm         = max(0.0, (raw - RANDOM_BASE) / (1.0 - RANDOM_BASE))
-            conf_from_prob = round(min(99.0, np.sqrt(norm) * 100), 1)
+            # ── Confidence: three-signal blend ──────────────────────────
+            # 1. Historical directional accuracy (most reliable signal)
+            #    50% → 35%, 60% → 53%, 70% → 71%, 80% → 89%
+            d_acc      = dir_accs.get(h_key, 50.0)
+            d_acc_clamped = max(50.0, min(100.0, d_acc))
+            acc_conf   = (d_acc_clamped - 50.0) / 50.0 * 90.0 + 35.0
 
-            # Blend with historical directional accuracy for stability
-            # 70% weight on calibrated proba, 30% weight on historical d_acc
-            d_acc       = dir_accs.get(h_key, 50.0)
-            d_acc_norm  = max(0.0, (d_acc - 50.0) / 50.0) * 100   # 50%→0, 100%→100
-            confidence  = round(0.70 * conf_from_prob + 0.30 * d_acc_norm, 1)
-            confidence  = max(5.0, min(99.0, confidence))   # floor at 5%
+            # 2. MAPE-based confidence (price accuracy signal)
+            #    MAPE 0% → 80%, MAPE 3% → 62%, MAPE 8% → 32%, MAPE 15% → 5%
+            mape_val   = val_mapes.get(h_key, 5.0)
+            mape_conf  = max(5.0, min(80.0, (10.0 - mape_val) / 10.0 * 75.0 + 5.0))
+
+            # 3. Live proba modifier ±8 pts (classifier conviction right now)
+            raw_prob   = float(proba[dir_pred])
+            proba_mod  = max(-8.0, min(8.0, (raw_prob - 0.38) * 40.0))
+
+            # Weighted blend: acc 50%, mape 30%, proba 20%
+            confidence = round(max(20.0, min(95.0,
+                0.50 * acc_conf + 0.30 * mape_conf + 0.20 * (50.0 + proba_mod * 5.0)
+            )), 1)
 
             # Magnitude from regressor
             pred_log_ret = float(rgr.predict(X_pruned)[0])
@@ -1096,14 +1101,16 @@ def _score_stock(ticker: str) -> dict[str, Any] | None:
         dir_pred   = int(np.argmax(proba))
         pred_ret   = float(rgr.predict(X_pruned)[0])
 
-        # Same sqrt rescaling as live predict for consistency
-        RANDOM_BASE    = 1.0 / 3.0
-        raw_p          = float(proba[dir_pred])
-        norm_p         = max(0.0, (raw_p - RANDOM_BASE) / (1.0 - RANDOM_BASE))
-        conf_from_prob = min(99.0, np.sqrt(norm_p) * 100)
-        d_acc          = dir_accs.get(best_horizon, 50.0)
-        d_acc_norm     = max(0.0, (d_acc - 50.0) / 50.0) * 100
-        confidence     = round(max(5.0, 0.70 * conf_from_prob + 0.30 * d_acc_norm), 1)
+        # Same three-signal blend as live predict
+        d_acc       = dir_accs.get(best_horizon, 50.0)
+        acc_conf    = (max(50.0, min(100.0, d_acc)) - 50.0) / 50.0 * 90.0 + 35.0
+        mape_val    = reg.get("val_mapes", {}).get(best_horizon, 5.0)
+        mape_conf   = max(5.0, min(80.0, (10.0 - mape_val) / 10.0 * 75.0 + 5.0))
+        raw_p       = float(proba[dir_pred])
+        proba_mod   = max(-8.0, min(8.0, (raw_p - 0.38) * 40.0))
+        confidence  = round(max(20.0, min(95.0,
+            0.50 * acc_conf + 0.30 * mape_conf + 0.20 * (50.0 + proba_mod * 5.0)
+        )), 1)
 
         # Predicted opening price (using log return from close)
         if dir_pred == 2:
