@@ -96,6 +96,11 @@ import config
 # }}
 _MODEL_REGISTRY: dict[str, dict[str, Any]] = {}
 
+# ── Prediction cache — avoids re-fetching OHLCV on every call ────────────────
+# {ticker: {"result": dict, "cached_at": datetime}}
+_PREDICT_CACHE: dict[str, dict] = {}
+_CACHE_TTL_SECONDS: int = 60   # refresh predictions every 60 seconds max
+
 # Direction thresholds — above/below these log-return % = UP/DOWN, else FLAT
 UP_THRESHOLD   =  0.002   # +0.2% log return
 DOWN_THRESHOLD = -0.002   # -0.2% log return
@@ -128,7 +133,7 @@ def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> tuple[p
                 return _clean_df(df), interval
         except Exception as exc:
             logger.warning("  %s  %s  error: %s", ticker, interval, exc)
-        time.sleep(1.5)
+        time.sleep(0.5)
 
     for period in ["6mo", "1y", "max"]:
         try:
@@ -139,7 +144,7 @@ def fetch_ohlcv(ticker: str, days: int = config.TRAINING_PERIOD_DAYS) -> tuple[p
                 return _clean_df(df), "1d"
         except Exception as exc:
             logger.warning("  %s  1d %s error: %s", ticker, period, exc)
-        time.sleep(0.5)
+        time.sleep(0.2)
 
     raise ValueError(f"All fetch strategies failed for {ticker}")
 
@@ -169,21 +174,16 @@ def fetch_pre_session(ticker: str) -> dict[str, Any]:
     try:
         tkr  = yf.Ticker(ticker)
         info = tkr.fast_info
-        result["bid"]         = getattr(info, "bid",        None)
-        result["ask"]         = getattr(info, "ask",        None)
-        result["volume"]      = getattr(info, "last_volume",None)
-        result["week52_high"] = getattr(info, "year_high",  None)
-        result["week52_low"]  = getattr(info, "year_low",   None)
-        result["market_cap"]  = getattr(info, "market_cap", None)
+        result["bid"]         = getattr(info, "bid",         None)
+        result["ask"]         = getattr(info, "ask",         None)
+        result["volume"]      = getattr(info, "last_volume", None)
+        result["week52_high"] = getattr(info, "year_high",   None)
+        result["week52_low"]  = getattr(info, "year_low",    None)
+        result["market_cap"]  = getattr(info, "market_cap",  None)
+        # Use fast_info for pre-market price (avoids slow tkr.info HTML scrape)
         try:
-            fi = tkr.info
-            result["pre_price"]  = fi.get("preMarketPrice")
-            result["avg_volume"] = fi.get("averageVolume")
-            result["pe_ratio"]   = fi.get("trailingPE")
-            last = fi.get("previousClose") or fi.get("regularMarketPreviousClose")
-            if result["pre_price"] and last:
-                result["pre_change_pct"] = round(
-                    (result["pre_price"] - last) / last * 100, 2)
+            result["pre_price"]    = getattr(info, "pre_market_price", None)
+            result["avg_volume"]   = getattr(info, "three_month_average_volume", None)
         except Exception:
             pass
     except Exception as exc:
@@ -468,7 +468,7 @@ def _build_classifier(X_tr, y_tr, X_va, y_va):
             random_state=42, n_jobs=1, verbose=-1,
         )
         model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
-                  callbacks=[lgb.early_stopping(30, verbose=False),
+                  callbacks=[lgb.early_stopping(15, verbose=False),
                               lgb.log_evaluation(period=-1)])
     else:
         model = XGBClassifier(
@@ -496,7 +496,7 @@ def _build_regressor(X_tr, y_tr, X_va, y_va):
             random_state=42, n_jobs=1, verbose=-1,
         )
         model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
-                  callbacks=[lgb.early_stopping(30, verbose=False),
+                  callbacks=[lgb.early_stopping(15, verbose=False),
                               lgb.log_evaluation(period=-1)])
     else:
         model = XGBRegressor(
@@ -531,7 +531,7 @@ def _select_features(X: np.ndarray, y_cls: np.ndarray,
 
     if _LGBM_AVAILABLE:
         import lightgbm as lgb
-        q = lgb.LGBMClassifier(n_estimators=80, max_depth=4,
+        q = lgb.LGBMClassifier(n_estimators=50, max_depth=3,
                                 random_state=42, n_jobs=1, verbose=-1,
                                 class_weight="balanced")
         q.fit(Xq, yq, eval_set=[(Xv, yv)],
@@ -539,7 +539,7 @@ def _select_features(X: np.ndarray, y_cls: np.ndarray,
                          lgb.log_evaluation(period=-1)])
         imp = q.feature_importances_.astype(float)
     else:
-        q = XGBClassifier(n_estimators=80, max_depth=4, random_state=42,
+        q = XGBClassifier(n_estimators=50, max_depth=3, random_state=42,
                           n_jobs=1, tree_method="hist",
                           use_label_encoder=False, eval_metric="mlogloss",
                           early_stopping_rounds=10)
@@ -585,10 +585,17 @@ def train_model(ticker: str) -> dict[str, Any]:
         valid   = ~np.isnan(log_ret)
         y_dir   = _make_direction_target(log_ret[valid])
 
-        X_sel, sel_features, sel_idx = _select_features(
-            X_scaled[valid], y_dir, feature_cols)
-        logger.info("  %s  features: %d → %d selected",
-                    ticker, len(feature_cols), len(sel_features))
+        # Skip expensive feature selection for small datasets — use all features
+        if len(X_scaled[valid]) < 300:
+            sel_features = feature_cols
+            sel_idx      = np.arange(len(feature_cols))
+            X_sel        = X_scaled[valid]
+            logger.info("  %s  small dataset — using all %d features", ticker, len(feature_cols))
+        else:
+            X_sel, sel_features, sel_idx = _select_features(
+                X_scaled[valid], y_dir, feature_cols)
+            logger.info("  %s  features: %d → %d selected",
+                        ticker, len(feature_cols), len(sel_features))
 
         # ── Train per horizon ─────────────────────────────────────────────────
         classifiers: dict[str, Any] = {}
@@ -646,18 +653,25 @@ def train_model(ticker: str) -> dict[str, Any]:
         if not classifiers:
             return {"ticker": ticker, "status": "error", "message": "All horizons failed"}
 
+        # Cache the last feature row for fast inference (avoids re-fetching every predict)
+        last_row   = X_scaled[-1:, sel_idx]
+        last_price = float(df["Close"].iloc[-1])
+
         _MODEL_REGISTRY[ticker] = {
-            "classifiers": classifiers,
-            "regressors":  regressors,
-            "scaler":      scaler,
-            "features":    sel_features,
-            "feat_idx":    sel_idx,
-            "interval":    interval,
-            "horizons":    horizons,
-            "dir_accs":    dir_accs,
-            "val_mapes":   val_mapes,
-            "trained_at":  datetime.utcnow(),
-            "row_count":   len(df),
+            "classifiers":  classifiers,
+            "regressors":   regressors,
+            "scaler":       scaler,
+            "features":     sel_features,
+            "feat_idx":     sel_idx,
+            "interval":     interval,
+            "horizons":     horizons,
+            "dir_accs":     dir_accs,
+            "val_mapes":    val_mapes,
+            "trained_at":   datetime.utcnow(),
+            "row_count":    len(df),
+            "last_X":       last_row,       # cached for fast inference
+            "last_price":   last_price,
+            "last_fetched": datetime.utcnow(),
         }
 
         return {
@@ -683,7 +697,7 @@ def train_all(tickers: list[str] | None = None) -> list[dict]:
     for i, t in enumerate(tickers):
         results.append(train_model(t))
         if i < len(tickers) - 1:
-            time.sleep(1.0)
+            time.sleep(0.5)
     return results
 
 
@@ -715,7 +729,14 @@ def get_sentiment_score(ticker: str) -> float:
         return 0.0
 
 
-def predict(ticker: str) -> dict[str, Any]:
+def predict(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
+    # ── Serve from cache if fresh enough ─────────────────────────────────────
+    if not force_refresh and ticker in _PREDICT_CACHE:
+        cached = _PREDICT_CACHE[ticker]
+        age    = (datetime.utcnow() - cached["cached_at"]).total_seconds()
+        if age < _CACHE_TTL_SECONDS:
+            return cached["result"]
+
     if ticker not in _MODEL_REGISTRY:
         r = train_model(ticker)
         if r["status"] != "ok":
@@ -734,19 +755,31 @@ def predict(ticker: str) -> dict[str, Any]:
     val_mapes= reg["val_mapes"]
 
     try:
-        df, _   = fetch_ohlcv(ticker, days=3)
-        df      = add_features(df)
-        df.dropna(inplace=True)
+        # Use cached feature row if fresh (< 60s old) — avoids re-fetching OHLCV
+        last_fetched = reg.get("last_fetched")
+        cache_age    = (datetime.utcnow() - last_fetched).total_seconds() if last_fetched else 999
 
-        if df.empty:
-            raise ValueError("No live data")
-
-        current_price = float(df["Close"].iloc[-1])
-        all_feats     = get_feature_columns(df)
-        latest        = df[all_feats].iloc[-1:].values.astype(float)
-        latest        = np.nan_to_num(latest, nan=0.0, posinf=0.0, neginf=0.0)
-        X_s           = scaler.transform(latest)
-        X_pruned      = X_s[:, feat_idx]
+        if cache_age < 60 and reg.get("last_X") is not None:
+            # Fast path: use cached features + price
+            X_pruned      = reg["last_X"]
+            current_price = reg["last_price"]
+        else:
+            # Slow path: re-fetch OHLCV (runs every 60s or first call)
+            df, _   = fetch_ohlcv(ticker, days=3)
+            df      = add_features(df)
+            df.dropna(inplace=True)
+            if df.empty:
+                raise ValueError("No live data")
+            current_price = float(df["Close"].iloc[-1])
+            all_feats     = get_feature_columns(df)
+            latest        = df[all_feats].iloc[-1:].values.astype(float)
+            latest        = np.nan_to_num(latest, nan=0.0, posinf=0.0, neginf=0.0)
+            X_s           = scaler.transform(latest)
+            X_pruned      = X_s[:, feat_idx]
+            # Update cache in registry
+            reg["last_X"]       = X_pruned
+            reg["last_price"]   = current_price
+            reg["last_fetched"] = datetime.utcnow()
 
         horizon_preds: dict[str, Any] = {}
         for h_key in horizons:
@@ -832,7 +865,7 @@ def predict(ticker: str) -> dict[str, Any]:
         risk_qty    = max(1, int(config.RISK_CAPITAL_INR / (current_price * config.RISK_PCT)))
         pre_session = fetch_pre_session(ticker)
 
-        return {
+        result = {
             "ticker":        ticker,
             "sector":        config.SECTOR_MAP.get(ticker, ""),
             "status":        "ok",
@@ -847,6 +880,9 @@ def predict(ticker: str) -> dict[str, Any]:
             "val_mapes":     val_mapes,
             "dir_accs":      dir_accs,
         }
+        # Store in cache
+        _PREDICT_CACHE[ticker] = {"result": result, "cached_at": datetime.utcnow()}
+        return result
 
     except Exception as exc:
         logger.warning("Predict failed for %s: %s", ticker, exc)
@@ -1186,7 +1222,7 @@ def after_market_analysis(top_n: int = 7) -> dict[str, Any]:
         scored = _score_stock(ticker)
         if scored:
             results.append(scored)
-        time.sleep(0.3)  # polite delay
+        time.sleep(0.1)  # polite delay
 
     if not results:
         return {
